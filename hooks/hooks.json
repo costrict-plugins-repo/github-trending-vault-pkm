@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [{
+          "type": "command",
+          "command": "node",
+          "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/session-start.js"],
+          "timeout": 15
+        }]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "^vault-pkm:pkm-capture$",
+        "hooks": [{
+          "type": "command",
+          "command": "node",
+          "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/capture-context.js"],
+          "timeout": 10
+        }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{
+          "type": "command",
+          "if": "Bash(gh pr create *)",
+          "command": "node",
+          "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/capture-reminder.js"],
+          "timeout": 10
+        }]
+      }
+    ]
+  }
+}

@@ -1,0 +1,368 @@
+# PKM: 01-Projects/Obsidian-MCP
+
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+This is a Claude Code plugin that provides an MCP server and supporting tools for bidirectional knowledge flow between Claude Code and an Obsidian vault. It packages 20 MCP tools, Claude Code hooks, and a setup skill under the `vault-pkm` plugin identity.
+
+## Commands
+
+```bash
+# Install dependencies
+npm install
+
+# Run the MCP server (for testing)
+VAULT_PATH="/path/to/your/vault" node cli.js
+
+# Vault scaffolding wizard (templates, PARA folders)
+node cli.js init
+
+# Start the server
+npm start
+
+# Run unit tests
+npm test
+
+# Run linter
+npm run lint
+
+# Type-check JSDoc (tsc + jsconfig.json)
+npm run typecheck
+```
+
+## Branching and Releases
+
+- `next` is the integration branch. Branch work from `next` and open draft PRs against `next`; a PR merges once CI passes and a review signs off.
+- `master` changes only through a single `next` → `master` release PR that Adrian reviews. Never push to, or merge into, `master` directly.
+- No release without Adrian's explicit agreement: no version bumps, tags, GitHub releases or npm publishes. Record changes under `## [Unreleased]` in `CHANGELOG.md`.
+- Commits use the repo-local AdrianV101 no-reply identity. Pushes and PR operations take the AdrianV101 token per command (`GH_TOKEN="$(gh auth token --user AdrianV101)" <command>`). Never run `gh auth switch`.
+- npm publishing happens only through `.github/workflows/publish.yml` on a published GitHub release. The workflow refuses unless the tag is `v<version>` and `package.json` and `.claude-plugin/plugin.json` both carry that version.
+
+## Architecture
+
+The project consists of three parts:
+
+**MCP Server**: A Node.js ES module server implementing the Model Context Protocol. The main entry point is `index.js` (server setup and request routing); tool definitions live in `tools.js` and handlers in `handlers.js`. `instructions.js` builds the server instructions (the vault rules every session receives, and the note routing table that `skills/pkm-write/SKILL.md` must match; `tests/instructions.test.js` keeps them equal), passed to the SDK in `index.js`. Shared modules: `vault-fs.js` (path containment, write-target rules, the live `FileIndex`, and `mutateFile`/`writeNew`, the only way notes are modified or created), `markdown.js` (dependency-free frontmatter splitting, heading parsing and section lookup; the hooks import it, so it must stay free of package imports), `frontmatter.js` (all YAML work, using `yaml`), `semantic-health.js` (dependency-free health formatting shared by the server, the hooks and doctor) and `helpers.js` (filtering, templates, peek). It provides 20 tools for vault interaction:
+- `vault_read` - Read note contents (supports pagination: `heading`, `tail`, `tail_sections` [with optional `section_level` param, default: 2], `chunk`, `lines`; auto-redirects to peek data for files >80k chars; `force` bypasses redirect; `heading` matches `## Foo` (level + text) or `Foo` (text at any level) and errors on duplicates; every mode's output is capped at 80k chars (400k with `force`) with a `[truncated: …; continue with lines: {start: N}]` marker)
+- `vault_peek` - Inspect file metadata/structure without reading full content (size, frontmatter, indented heading tree with each heading's line number and section size, preview); the outline lists 50 headings at a time, and `outline_offset` (a whole number below the heading count) pages through longer ones
+- `vault_write` - Create new notes from templates (enforces frontmatter; settable fields: `session`, `status`, `priority`, `project`, `deciders`, `due`, `source`; `variables` param for custom `<%...%>` substitution in template body)
+- `vault_append` - Add content to existing files, with optional positional insert (after/before heading, end of section)
+- `vault_edit` - Surgical string replacement (exact match, single occurrence)
+- `vault_update_frontmatter` - Update YAML frontmatter fields atomically (set, create, remove fields)
+- `vault_search` - Full-text search across markdown files
+- `vault_semantic_search` - Semantic similarity search using OpenAI embeddings (requires `VAULT_PKM_OPENAI_KEY` or `OPENAI_API_KEY`)
+- `vault_suggest_links` - Suggest relevant notes to link based on content similarity; `graph_context: true` for graph-semantic blending (requires `VAULT_PKM_OPENAI_KEY` or `OPENAI_API_KEY`)
+- `vault_list` / `vault_recent` - Directory listing and recent files
+- `vault_links` - Wikilink analysis (`[[...]]` syntax)
+- `vault_neighborhood` - Graph context exploration via BFS wikilink traversal
+- `vault_query` - Query notes by YAML frontmatter (type, status, `tags` [ALL must match], `tags_any` [ANY must match], dates, `custom_fields` for arbitrary field matching, `sort_by`/`sort_order` for result ordering)
+- `vault_tags` - Discover all tags with per-note counts; supports folder scoping, glob patterns, inline `#tag` parsing
+- `vault_activity` - Query/clear activity log (all tool calls with timestamps and session IDs)
+- `vault_trash` - Soft-delete a note to `.trash/` (Obsidian convention), warns about broken incoming links; refuses folders
+- `vault_move` - Move/rename notes or folders with automatic wikilink updating across vault (`update_links: false` to skip); folder moves do not rewrite links that pointed at notes inside the folder
+- `vault_add_links` - Add annotated wikilinks to a note's section with deduplication (default: ## Related)
+- `vault_link_health` - Graph health report: orphans, broken links, weakly connected notes, ambiguous links
+
+The server uses `VAULT_PATH` environment variable (defaults to `~/Documents/PKM`) and includes path security to prevent directory escaping. Optional `VAULT_PKM_VAULT_NAME` overrides the vault name embedded in `obsidian://` links in tool output (defaults to `basename(VAULT_PATH)`); set this only when the on-disk folder name differs from the vault name registered in Obsidian.
+
+### vault_neighborhood (Graph Context Exploration)
+
+Explores the graph neighborhood around a note by traversing wikilinks using BFS. Returns notes grouped by hop distance with frontmatter metadata.
+
+- Resolves wikilink targets to actual file paths (handles `[[note]]`, `[[folder/note]]`, `[[note|alias]]`, `[[note#heading]]`)
+- Detects ambiguous links (multiple files with same basename) and annotates them
+- Per-call indexes: basename resolution map + incoming link index (no persistent state)
+- Params: `path` (required), `depth` (default: 2), `direction` (`"both"` | `"outgoing"` | `"incoming"`), `include_semantic` (boolean, appends unlinked semantic results), `semantic_limit` (default: 5), `max_nodes` (default: 50; extra nodes reported as "+N not shown")
+- Implementation: `graph.js` module (link resolution, BFS traversal, formatting)
+
+### vault_semantic_search (Semantic Similarity Search)
+
+Finds conceptually related notes even when they use different terminology. For example, searching "managing overwhelm" finds notes about "cognitive load" or "information overload".
+
+- Requires `VAULT_PKM_OPENAI_KEY` or `OPENAI_API_KEY` env var — tool is hidden from tool list when not set
+- Uses OpenAI `text-embedding-3-large` (3072 dimensions)
+- Index stored at `$VAULT_PATH/.obsidian/semantic-index.db` (SQLite + sqlite-vec)
+- Write tools notify the index directly (`notifyChanged`/`notifyRemoved`/`notifyMoved`); a background `fs.watch` (restarted with backoff after errors) catches other changes; startup sync catches changes made while the server was stopped
+- API errors are classified (`EmbeddingError.kind`): auth and quota failures put the index into a disabled state persisted in `.obsidian/semantic-stats.json` (`status`, `reason`, `since`, `last_success_at`, `stale_files`); startup and each semantic tool call probe once, and the index re-enables on success; rate limits and transient errors are retried up to 3 times
+- Reindexes of one note are serialized, and the content hash is re-checked inside the store transaction
+- Chunking: whole-note for short notes, heading-based (`##`) splits for notes > ~2000 tokens
+- Params: `query` (required), `limit`, `folder`, `threshold` (0-1 similarity score), `anchor` (optional path for graph-distance weighting), `graph_weight` (0-1, default: 0.3)
+
+```javascript
+// Graph-weighted search biased toward a specific note's neighborhood
+vault_semantic_search({ query: "cache eviction strategies", anchor: "research/caching.md", graph_weight: 0.3 })
+```
+
+The semantic index is a regenerable cache — deleting `semantic-index.db` triggers a full re-embed on next startup. The DB lives in `.obsidian/` but is local to each machine: Obsidian Sync does not carry it, so every machine builds its own index.
+
+### vault_write (Template-Based Note Creation)
+
+Notes must be created from templates to ensure proper frontmatter. The tool:
+- Loads templates from `05-Templates/` at startup; a template missing there falls back to the bundled copy in `templates/` (the vault copy wins; entries carry `source: "vault" | "bundled"`)
+- Auto-substitutes `<% tp.date.now("YYYY-MM-DD") %>` and `<% tp.file.title %>`
+- Accepts `frontmatter` param for tags and other fields (`session`, `status`, `priority`, `project`, `deciders`, `due`, `source`)
+- Validates required fields: `type`, `created`, `tags`
+- Validates enum fields for task notes: `status` (pending/active/done/cancelled), `priority` (low/normal/high/urgent)
+- Errors if file already exists (use `vault_edit` or `vault_append` to modify)
+
+Examples:
+```javascript
+vault_write({
+  template: "adr",
+  path: "01-Projects/MyApp/development/decisions/ADR-001-database.md",
+  frontmatter: { tags: ["decision", "database"], deciders: "Team" }
+})
+
+vault_write({
+  template: "task",
+  path: "01-Projects/MyApp/planning/task-api-refactor.md",
+  frontmatter: { tags: ["task", "api"], priority: "high", project: "MyApp", due: "2026-03-01" }
+})
+```
+
+### vault_activity (Session Memory / Activity Log)
+
+Logs all MCP tool calls with timestamps and session IDs. Enables cross-session memory — Claude can recall what was read, written, or searched in previous sessions.
+
+- Storage: SQLite DB at `$VAULT_PATH/.obsidian/activity-log.db` (separate from semantic index)
+- Session ID: generated via `crypto.randomUUID()` at MCP server startup (each conversation gets its own)
+- Logs every tool call except `vault_activity` itself
+- Supports filtering by tool name, session ID, date range, and path (exact note, or folder prefix; the filter matches the stored argument, so it needs the full vault-relative path, is case-sensitive, and a short name or partial folder matches nothing)
+- Arguments are summarised before storage: strings over 200 chars become `"<N chars>"`, except vault paths: the top-level `path`, `source`, `destination`, `folder`, `target`, `old_path`, `new_path` arguments and `links[].target` (the same key names inside `frontmatter`, `fields`, `custom_fields` or `variables` are summarised)
+- Retention: rows older than `VAULT_PKM_ACTIVITY_RETENTION_DAYS` (default 90; `0`, or a window too long to compute, keeps everything) are deleted at server start, but only on a log the server created (approval recorded in its `activity_meta` table) or one the user approved with `obsidian-pkm trim-activity` (`trim-activity.js`), or while the variable is set explicitly; a log an older version left behind keeps everything until then. Each start copies the state and the count of entries outside the window to `.obsidian/activity-retention.json` (`activity-retention.js`, dependency-free) for the `activity-retention` upgrade step; nothing reads that copy to decide a deletion; the DB uses `auto_vacuum = INCREMENTAL` and `secure_delete = ON` (deleted content is zeroed)
+- Schema version in `PRAGMA user_version` (1 = indexed `path` column + summarised args)
+- Privacy: `action: "clear"` deletes entries (with optional filters), or delete the DB file
+
+```javascript
+vault_activity()                                    // Recent 50 entries
+vault_activity({ tool: "vault_write" })             // Only writes
+vault_activity({ session: "abc12345" })             // Filter by session ID prefix
+vault_activity({ since: "2026-02-08" })             // Today's activity
+vault_activity({ path: "01-Projects/MyApp" })       // Activity on specific project
+vault_activity({ action: "clear" })                 // Clear all history
+vault_activity({ action: "clear", before: "2026-01-01" })  // Clear old entries
+```
+
+Implementation: `activity.js` (ActivityLog class)
+
+### vault_update_frontmatter (Atomic Frontmatter Updates)
+
+Safely updates YAML frontmatter fields in an existing note without touching the body content. Parses existing frontmatter, applies changes, and writes back.
+
+- Set fields to new values, add new fields, or remove fields by setting to `null`
+- Protected fields (`type`, `created`, `tags`) cannot be removed (only updated)
+- Arrays (like `tags`) are replaced wholesale
+- Only the changed keys' lines are rewritten: comments, quoting, inline lists, number formats such as `1.10`, CRLF and every other field are preserved byte for byte; removing a key removes only its lines
+- Enum validation: task `status` must be one of `pending`, `active`, `done`, `cancelled`; task `priority` must be one of `low`, `normal`, `high`, `urgent` — non-task types are unconstrained
+- Requires exact path (no fuzzy resolution — destructive operation)
+
+```javascript
+vault_update_frontmatter({
+  path: "01-Projects/MyApp/planning/task-api-refactor.md",
+  fields: { status: "active", priority: "urgent" }
+})
+
+// Remove a field by setting to null
+vault_update_frontmatter({
+  path: "01-Projects/MyApp/planning/task-api-refactor.md",
+  fields: { due: null }  // removes the due field
+})
+```
+
+Implementation: `updateFrontmatter` in `frontmatter.js` (YAML via the `yaml` package, core schema), handler in `handlers.js`
+
+### vault_add_links (Atomic Link Insertion)
+
+Add annotated wikilinks to a note's section with deduplication. Validates targets exist, skips duplicates by basename (case-insensitive). Creates the section if missing.
+
+- Requires exact path (no fuzzy resolution — destructive operation)
+- Deduplicates by basename: `[[note]]` won't be added if `[[note]]` or `[[folder/note]]` already in file
+- Section insertion point: end of section (before next same-or-higher heading, or EOF)
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `path` | string | Exact vault-relative path (required) |
+| `links` | array | Links to add: `[{ target, annotation }]` (required) |
+| `section` | string | Target section heading (default: `## Related`) |
+| `create_section` | boolean | Create section if missing (default: true) |
+
+```javascript
+vault_add_links({
+  path: "research/caching.md",
+  links: [
+    { target: "decisions/ADR-003-caching.md", annotation: "supersedes this earlier approach" },
+    { target: "research/architecture-patterns.md", annotation: "foundational patterns referenced" }
+  ]
+})
+```
+
+### vault_link_health (Graph Health Report)
+
+Audit link quality across the vault or a specific folder. Returns categorized report of link issues.
+
+- **orphans**: Notes with zero incoming AND zero outgoing wikilinks
+- **broken**: Wikilinks that resolve to no existing file
+- **weak**: Notes with only 1 total resolved link (incoming + outgoing; broken links don't count)
+- **ambiguous**: Wikilinks where basename resolves to multiple files
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `folder` | string | Optional: scope to folder (fuzzy resolution supported) |
+| `checks` | array | Which checks: `orphans`, `broken`, `weak`, `ambiguous` (default: all) |
+| `limit` | number | Max results per category (default: 20) |
+
+```javascript
+vault_link_health({ folder: "01-Projects/MyApp", checks: ["orphans", "broken"] })
+```
+
+Implementation: `handleLinkHealth` in `handlers.js`, uses `buildIncomingIndex` from `graph.js` for O(M) performance.
+
+### vault_query (Enhanced Filtering and Sorting)
+
+In addition to the standard filters (type, status, `tags` [ALL must match], `tags_any` [ANY must match], dates, folder), `vault_query` supports:
+
+- `custom_fields` — filter by arbitrary frontmatter fields (exact match); use `null` to match notes where a field is missing
+- `sort_by` — sort results by any frontmatter field; smart ordering for priority (`urgent > high > normal > low`), chronological for dates, alphabetical otherwise; nulls sort last
+- `sort_order` — `"asc"` (default) or `"desc"`
+
+```javascript
+vault_query({ type: "task", custom_fields: { priority: "high" }, sort_by: "due" })
+vault_query({ tags: ["task"], sort_by: "priority", sort_order: "asc" })
+vault_query({ custom_fields: { project: "MyApp", due: null } })  // tasks with no due date
+```
+
+### Fuzzy Path Resolution
+
+Read-only tools (`vault_read`, `vault_peek`, `vault_links`, `vault_neighborhood`, `vault_suggest_links`) support fuzzy path resolution:
+- Exact paths still work as before (zero overhead)
+- Short names resolve by basename: `"devlog"` → `"01-Projects/MyApp/development/devlog.md"`
+- `.md` extension is optional: `"devlog"` and `"devlog.md"` both work
+- Ambiguous names (multiple files with same basename) return an error listing all candidates
+- Pass the full path to disambiguate; an input containing `/` must match the end of the real path
+
+Folder-scoped tools (`vault_list`, `vault_search`, `vault_query`, `vault_tags`, `vault_recent`, `vault_link_health`) support fuzzy folder resolution:
+- Exact folder paths still work as before
+- Partial names match by substring: `"MyApp"` → `"01-Projects/MyApp"`
+- Ambiguous matches return an error listing candidates
+
+Write/destructive tools (`vault_write`, `vault_append`, `vault_edit`, `vault_update_frontmatter`, `vault_trash`, `vault_move`, `vault_add_links`) require exact paths to prevent accidental modifications, and the writing ones only accept `.md` notes outside dot-folders.
+
+Implementation: `FileIndex.exists`/`FileIndex.resolveFuzzy` in `vault-fs.js` for notes, `resolveFuzzyFolder` in `helpers.js` for folders
+
+### PKM Agents
+
+The plugin provides 3 specialized agents (visible in `/agents`). Delegate to them proactively:
+
+| Agent | When to Delegate | Mode |
+|---|---|---|
+| `vault-explorer` | When researching what the vault already knows about a topic | Foreground |
+| `pkm-capture` | When a PR is opened (automatic via PostToolUse hook after a successful `gh pr create`), after significant work blocks, before session ends | Background |
+| `link-auditor` | After creating/modifying multiple vault notes, periodic health checks | Background |
+
+**pkm-capture context:** The prompt needs only an optional focus note, the PR URL and, after a failed capture, the activity file it named. A SubagentStart hook (`hooks/capture-context.js`, matcher `^vault-pkm:pkm-capture$`) gives the agent its project, the session, a delta file with the condensed session activity since the previous capture and a `Devlog:` line naming the session's note to add a section to (or the name of the note to create), and records the capture position (`hooks/capture-state.js`) when the agent starts, because a stop hook receives no final message to judge success by; a capture with no project leaves the position alone. The agent ends with a `Status:` line, and a failed one names its activity file so the next dispatch can pass it on. It runs on sonnet, or on opus when the PR reminder finds the PR changes more than 1,000 lines, with user-scoped memory (the other agents have none). It handles both the devlog section and knowledge capture (decisions, research, tasks, bugs) in one pass. Conservative — most exchanges produce nothing worth capturing beyond the devlog entry. See `hooks/README.md` for the hook details.
+
+**Project resolution** (`hooks/resolve-project.js`): a `# PKM:` annotation in `CLAUDE.local.md`/`CLAUDE.md`/`.claude/CLAUDE.md`, then a `repos:` list in a project's `_index.md` matched against normalised git remotes, then the main checkout's folder name. `/vault-pkm:init-project` links a repo by adding its remote to `repos:` and removing it from any other project's list (or writes a `CLAUDE.local.md` line in the main checkout when there is no remote) and never edits `CLAUDE.md`. `npx obsidian-pkm doctor` reports the project for the current folder.
+
+**Devlog**: each session has its own note in `<project>/development/devlog/` (`YYYY-MM-DD HHmm <Title>.md`); `devlog.md` is the hub. `devlog.js` holds the note names, folder listing, session-note lookup and the parser for the old single-file format. `migrate-devlog.js` (CLI: `obsidian-pkm migrate-devlog <project> [--apply]`, previews by default) splits an old `devlog.md` into day notes; `/vault-pkm:migrate-devlog` wraps it. Session start (`hooks/load-context.js`) loads the index, up to 10 open tasks (the `active` and `pending` notes in `<project>/tasks/`, one line each) and the 10 newest devlog items within 9,500 characters. It also runs `upgrade-checks.js` (dependency-free; shared with doctor) and appends, through `hooks/upgrade-block.js`, a block of at most 1,200 characters telling Claude which upgrade steps are left; the context budget shrinks by the block's length. "Never" answers live in `~/.claude/vault-pkm/upgrade-dismissals.json` (`upgrade-dismissals.js`), written by `obsidian-pkm upgrade dismiss|reset` (`upgrade.js`).
+
+**Templates** (`templates/`): Obsidian note templates for project documentation:
+- `project-index.md` - Project overview with YAML frontmatter
+- `adr.md` - Architecture Decision Record format
+- `devlog.md` - Devlog hub: an embedded Obsidian Bases table of the project's `development/devlog/` folder (`<% devlog_folder %>`)
+- `devlog-session.md` - One session's devlog note (`type: devlog-session`, `session`, sections per capture)
+- `permanent-note.md` - Atomic evergreen notes
+- `research-note.md` - Research findings and analysis
+- `troubleshooting-log.md` - Bug investigations and fixes
+- `fleeting-note.md` - Quick captures and temporary thoughts
+- `literature-note.md` - Notes on articles, books, talks
+- `meeting-notes.md` - Meeting records
+- `moc.md` - Maps of Content (index/hub notes)
+- `daily-note.md` - Daily notes
+- `task.md` - Structured task notes with status, priority, due date, project, and source fields
+- `note.md` - Minimal generic note
+
+**Sample CLAUDE.md** (`sample-project/CLAUDE.md`): An 8-line optional template for code repositories: a commented-out `# PKM:` line for repos without a remote, and a place for repo-specific notes. The vault rules come from the server instructions, not from the repo.
+
+## Claude Code Configuration
+
+```bash
+claude plugin marketplace add anthropics/claude-plugins-community
+claude plugin install vault-pkm@claude-community
+```
+
+Then run `/vault-pkm:setup` in Claude Code to configure vault path, API keys, and permissions.
+
+For vault scaffolding (templates, PARA folders): `npx obsidian-pkm init`
+
+`VAULT_PKM_OPENAI_KEY` (or `OPENAI_API_KEY`) is optional — without it, all tools except `vault_semantic_search` and `vault_suggest_links` work normally. The plugin-scoped name avoids conflicts with project-level OpenAI keys. `OBSIDIAN_PKM_OPENAI_KEY` is still read as a deprecated fallback for users who configured it before the rename.
+
+## Vault Structure Convention
+
+```
+Vault/
+├── 00-Inbox/
+├── 01-Projects/           # Active projects
+│   └── ProjectName/
+│       ├── _index.md
+│       ├── planning/
+│       ├── research/
+│       └── development/decisions/
+├── 02-Areas/
+├── 03-Resources/Development/  # Reusable knowledge
+├── 04-Archive/
+├── 05-Templates/
+└── 06-System/
+```
+
+## Key Conventions
+
+- ADR naming: `ADR-{NNN}-{kebab-title}.md`
+- Project index files: `_index.md`
+- All notes use YAML frontmatter with `type`, `status`, `created` fields
+- Paths passed to MCP tools are relative to vault root
+- **Version bumps must update BOTH files**: `package.json` AND `.claude-plugin/plugin.json`, including the server pin in `plugin.json` (`obsidian-pkm@<version>`, exact, as the plugin directory requires). The plugin system reads version from `plugin.json`, not `package.json` — forgetting `plugin.json` causes updates to appear stuck. `tests/manifest.test.js` and the publish workflow both fail when the versions or the pin differ.
+- **Hooks in `hooks/hooks.json` are `"command": "node"` with `"args": ["${CLAUDE_PLUGIN_ROOT}/hooks/<file>.js"]`**: no shell text and no other variable (the plugin directory refuses a computed path). Hook scripts read `VAULT_PATH` from their environment.
+
+## Metadata Schema
+
+**Canonical reference:** `06-System/metadata-schema.md`
+
+When creating ANY note via MCP, ALWAYS include frontmatter:
+```yaml
+---
+type: <type>        # Required: see schema for allowed values
+created: YYYY-MM-DD # Required
+tags: [...]         # Required: at least one tag
+status: <status>    # If applicable for the type
+---
+```
+
+Common types: `fleeting`, `research`, `adr`, `bug`, `planning`, `transcript`, `permanent`, `task`
+
+**Never create notes without frontmatter** — even quick research docs or ad-hoc files.
+
+## PKM Integration
+
+- **Vault project**: `01-Projects/Obsidian-MCP/`
+- **MCP Server**: `vault-pkm` plugin
+
+Document decisions, research findings, and debugging sessions as you work. The `pkm-capture` agent captures devlog entries and PKM-worthy content in the background (triggered automatically when a PR is created with `gh pr create`), or use the `vault-pkm:pkm-write` skill for structured notes with linking.
+
+Use `vault-pkm:pkm-explore` to research what the vault already knows about a topic before creating new content.
+
+At the end of each session, run `vault-pkm:pkm-session-end` to update the devlog and capture undocumented work.
+
+Use `vault-pkm:triage-tasks` to surface and batch-update open task statuses (numbered list, shorthand input like "1,3 done | 2 active"). Use `vault-pkm:add-task` for fast task capture from the conversation. Use `vault-pkm:tackle-task` to work on a specific task end-to-end: reads the note, explores vault context, routes to the right workflow (trivial/standard/significant), and closes the task when done.
+
+### Referring to vault files
+
+Whenever you mention a vault note, PKM file, or file inside `01-Projects/Obsidian-MCP/` in your response to the user — whether quoting tool output, summarizing what you read, or referring to a file by name — format it as a markdown link to its `obsidian://` URI so the user can click to open it in Obsidian:
+
+`[01-Projects/Obsidian-MCP/some/note.md](obsidian://open?vault=PKM&file=01-Projects%2FObsidian-MCP%2Fsome%2Fnote)`
+
+Encoding rules: percent-encode `/` as `%2F` and spaces as `%20`. Strip the trailing `.md` from the URL `file=` parameter, but keep `.md` in the visible link text. The vault name (`PKM`) is also visible in any vault-pkm tool output.
+
+The vault-pkm MCP tools already emit paths in this format. Preserve the link form when relaying; don't revert to bare paths like `01-Projects/Obsidian-MCP/...` for inline mentions. Apply the same format proactively when mentioning a vault file you haven't just queried (e.g., when answering "what's in the devlog?" or "see ADR-002").

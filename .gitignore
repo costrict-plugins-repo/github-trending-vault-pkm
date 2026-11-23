@@ -1,0 +1,14 @@
+node_modules/
+.claude/
+.env
+.env.local
+*.db
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+coverage/
+.worktrees/
+docs/superpowers/
+assets/*
+!assets/banner.svg

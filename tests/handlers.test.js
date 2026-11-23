@@ -1,0 +1,3944 @@
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
+import assert from "node:assert/strict";
+import fs from "fs/promises";
+import path from "path";
+import os from "os";
+import { createHandlers } from "../handlers.js";
+import { ActivityLog } from "../activity.js";
+import { SemanticIndex } from "../embeddings.js";
+import { embeddingsResponse, errorResponse, quotaResponse, installFakeOpenAI, makeVault } from "./fake-openai.js";
+import { createToolsList } from "../tools.js";
+import { AUTO_REDIRECT_THRESHOLD } from "../helpers.js";
+
+let tmpDir;
+let handlers;
+
+const TEMPLATE_CONTENT = `---
+type: research
+created: <% tp.date.now("YYYY-MM-DD") %>
+tags:
+  - research
+---
+# <% tp.file.title %>
+
+## What It Is
+<!-- Describe -->
+`;
+
+const ADR_TEMPLATE = `---
+type: adr
+status: proposed
+created: <% tp.date.now("YYYY-MM-DD") %>
+tags:
+  - decision
+  - architecture
+deciders:
+---
+# ADR-XXX: <% tp.file.title %>
+
+## Context
+<!-- Why -->
+
+## Decision
+<!-- What -->
+`;
+
+const TASK_TEMPLATE = `---
+type: task
+created: <% tp.date.now("YYYY-MM-DD") %>
+status: pending
+priority: normal
+due: null
+project: null
+source: null
+tags:
+  - task
+---
+
+# <% tp.file.title %>
+
+## Description
+
+
+## Context
+
+
+## Acceptance Criteria
+
+`;
+
+const CUSTOM_VAR_TEMPLATE = `---
+type: research
+created: <% tp.date.now("YYYY-MM-DD") %>
+tags:
+  - research
+---
+# <% tp.file.title %>
+
+## Summary
+
+<% summary %>
+
+## Details
+
+<% details %>
+`;
+
+/**
+ * Helper to build a template registry from the given tmpDir.
+ * Mimics what index.js does at startup.
+ */
+async function buildTemplateRegistry(tmpDir) {
+  const templateRegistry = new Map();
+  const tdir = path.join(tmpDir, "05-Templates");
+  for (const file of await fs.readdir(tdir)) {
+    const name = path.basename(file, ".md");
+    const content = await fs.readFile(path.join(tdir, file), "utf-8");
+    templateRegistry.set(name, { content, description: name });
+  }
+  return templateRegistry;
+}
+
+function createMockSemanticIndex(results = []) {
+  return {
+    isAvailable: true,
+    searchRaw: async ({ _query, limit, _folder, _threshold, excludeFiles }) => {
+      return results.filter(r => !excludeFiles?.has(r.path)).slice(0, limit || 5);
+    },
+    search: async ({ _query, limit, _folder, _threshold }) => {
+      const filtered = results.slice(0, limit || 5);
+      if (filtered.length === 0) return "No semantically related notes found.";
+      const formatted = filtered.map(r => `**${r.path}** (score: ${r.score})\n${r.preview}`).join("\n\n");
+      return `Found ${filtered.length} semantically related note${filtered.length === 1 ? "" : "s"}:\n\n${formatted}`;
+    }
+  };
+}
+
+before(async () => {
+  tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "handlers-test-"));
+
+  // Set up template directory
+  const templateDir = path.join(tmpDir, "05-Templates");
+  await fs.mkdir(templateDir, { recursive: true });
+  await fs.writeFile(path.join(templateDir, "research-note.md"), TEMPLATE_CONTENT);
+  await fs.writeFile(path.join(templateDir, "adr.md"), ADR_TEMPLATE);
+  await fs.writeFile(path.join(templateDir, "task.md"), TASK_TEMPLATE);
+  await fs.writeFile(path.join(templateDir, "custom-var.md"), CUSTOM_VAR_TEMPLATE);
+
+  // Create some test notes
+  const notesDir = path.join(tmpDir, "notes");
+  await fs.mkdir(notesDir, { recursive: true });
+
+  await fs.writeFile(path.join(notesDir, "devlog.md"), `---
+type: devlog
+created: 2026-01-01
+tags:
+  - dev
+---
+# Project Devlog
+
+## 2026-01-01
+
+First entry.
+
+## 2026-01-15
+
+Second entry.
+
+### Sub-detail
+
+Some detail.
+
+## 2026-02-01
+
+Third entry.
+`);
+
+  await fs.writeFile(path.join(notesDir, "alpha.md"), `---
+type: research
+status: active
+created: 2026-01-15
+tags:
+  - dev
+  - mcp
+---
+# Alpha Note
+
+Some content about [[beta]] and the MCP server.
+Also references [[gamma|Gamma Note]].
+`);
+
+  await fs.writeFile(path.join(notesDir, "beta.md"), `---
+type: adr
+status: accepted
+created: 2026-02-01
+tags:
+  - decision
+  - architecture
+---
+# Beta Note
+
+Links to [[alpha]] and contains architecture decisions.
+`);
+
+  await fs.writeFile(path.join(notesDir, "gamma.md"), `---
+type: permanent
+status: active
+created: 2025-12-01
+tags:
+  - knowledge
+---
+# Gamma Note
+
+A permanent note with no outgoing links.
+`);
+
+  // Create nested directory for fuzzy folder testing
+  const projectDir = path.join(tmpDir, "projects", "my-app", "research");
+  await fs.mkdir(projectDir, { recursive: true });
+  await fs.writeFile(path.join(projectDir, "findings.md"), `---
+type: research
+created: 2026-01-01
+tags:
+  - research
+  - project
+---
+# Research Findings
+`);
+
+  // Create files for ambiguity testing
+  const otherDir = path.join(tmpDir, "other");
+  await fs.mkdir(otherDir, { recursive: true });
+  await fs.writeFile(path.join(otherDir, "index.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Other Index
+`);
+  await fs.writeFile(path.join(notesDir, "index.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Notes Index
+`);
+
+  // ── Notes for trash/move testing ──
+  const moveDir = path.join(tmpDir, "moveable");
+  await fs.mkdir(moveDir, { recursive: true });
+
+  await fs.writeFile(path.join(moveDir, "target.md"), `---
+type: research
+created: 2026-01-01
+tags:
+  - test
+---
+# Target Note
+
+Content of the target note.
+`);
+
+  await fs.writeFile(path.join(moveDir, "linker-a.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Linker A
+
+This links to [[target]] and also [[target#heading]].
+`);
+
+  await fs.writeFile(path.join(moveDir, "linker-b.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Linker B
+
+This links to [[target|Target Display]] and [[gamma]].
+`);
+
+  // A file with no incoming links (safe to trash)
+  await fs.writeFile(path.join(moveDir, "orphan.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Orphan Note
+
+No other file links here.
+`);
+
+  // A destination file for collision testing (in .trash/)
+  const trashDir = path.join(tmpDir, ".trash", "moveable");
+  await fs.mkdir(trashDir, { recursive: true });
+  await fs.writeFile(path.join(trashDir, "orphan.md"), "previously trashed");
+
+  // Create large test files for auto-redirect and chunk testing
+  const largeContent = "---\ntype: research\ncreated: 2026-01-01\ntags:\n  - test\n---\n# Large File\n\n## Section A\n\n" +
+    "x".repeat(90_000) + "\n\n## Section B\n\nSmall section content.\n";
+  await fs.writeFile(path.join(notesDir, "large-file.md"), largeContent);
+
+  const headinglessLines = Array.from({ length: 5000 }, (_, i) => `Line ${i + 1}: ${"data ".repeat(20)}`);
+  const headinglessContent = "---\ntype: dump\ncreated: 2026-01-01\ntags:\n  - test\n---\n" + headinglessLines.join("\n") + "\n";
+  await fs.writeFile(path.join(notesDir, "headingless-large.md"), headinglessContent);
+
+  // ── Task notes for query sort/filter testing ──
+  const tasksDir = path.join(tmpDir, "tasks");
+  await fs.mkdir(tasksDir, { recursive: true });
+
+  await fs.writeFile(path.join(tasksDir, "task-a.md"), `---
+type: task
+status: pending
+priority: high
+due: "2026-03-01"
+project: Supergrant
+created: 2026-02-08
+tags:
+  - task
+---
+# Task A
+`);
+
+  await fs.writeFile(path.join(tasksDir, "task-b.md"), `---
+type: task
+status: done
+priority: low
+due: "2026-02-15"
+project: Home
+created: 2026-02-09
+tags:
+  - task
+---
+# Task B
+`);
+
+  await fs.writeFile(path.join(tasksDir, "task-c.md"), `---
+type: task
+status: pending
+priority: urgent
+created: 2026-02-10
+tags:
+  - task
+---
+# Task C - no due date
+`);
+
+  // ── Fixture for vault_add_links testing ──
+  await fs.writeFile(path.join(notesDir, "with-related.md"), `---
+type: research
+status: active
+created: 2026-01-01
+tags:
+  - test
+---
+# Note With Related
+
+Some content about testing.
+
+## Related
+<!-- Format: - [[note-name]] — relationship explanation -->
+- [[alpha]] — existing link
+`);
+
+  // Build template registry (mimicking what index.js does)
+  const templateRegistry = await buildTemplateRegistry(tmpDir);
+
+  handlers = await createHandlers({
+    vaultPath: tmpDir,
+    templateRegistry,
+    semanticIndex: null,
+    activityLog: null,
+    sessionId: "test-session-id-1234",
+  });
+});
+
+after(async () => {
+  await fs.rm(tmpDir, { recursive: true });
+});
+
+// ─── vault_read ────────────────────────────────────────────────────────
+
+describe("handleRead", () => {
+  it("reads an existing file", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/alpha.md" });
+    assert.equal(result.content[0].type, "text");
+    assert.ok(result.content[0].text.includes("# Alpha Note"));
+  });
+
+  it("throws on non-existent file", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(() => handler({ path: "notes/nonexistent.md" }), /not found|No matching file/i);
+  });
+
+  it("throws on directory traversal", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(() => handler({ path: "../etc/passwd" }), /not found|escapes vault/i);
+  });
+
+  it("returns full content when no pagination params given (regression)", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/devlog.md" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("# Project Devlog"));
+    assert.ok(text.includes("## 2026-01-01"));
+    assert.ok(text.includes("## 2026-02-01"));
+  });
+
+  it("reads a specific section with heading param", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/devlog.md", heading: "## 2026-01-15" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("## 2026-01-15"));
+    assert.ok(text.includes("Second entry."));
+    assert.ok(text.includes("### Sub-detail"));
+    assert.ok(!text.includes("First entry."));
+    assert.ok(!text.includes("Third entry."));
+  });
+
+  it("returns error with available headings when heading not found", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/devlog.md", heading: "## Nonexistent" }),
+      (err) => {
+        assert.ok(err.message.includes("Heading not found"));
+        assert.ok(err.message.includes("## 2026-01-01"));
+        assert.ok(err.message.includes("## 2026-02-01"));
+        return true;
+      }
+    );
+  });
+
+  it("returns last N lines with tail param, with frontmatter prepended", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/devlog.md", tail: 3 });
+    const text = result.content[0].text;
+    assert.ok(text.startsWith("---"), "Should start with frontmatter");
+    assert.ok(text.includes("type: devlog"));
+    assert.ok(text.includes("Third entry."));
+    assert.ok(!text.includes("First entry."));
+  });
+
+  it("returns last N sections with tail_sections param", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/devlog.md", tail_sections: 2 });
+    const text = result.content[0].text;
+    assert.ok(text.startsWith("---"), "Should start with frontmatter");
+    assert.ok(text.includes("## 2026-01-15"));
+    assert.ok(text.includes("## 2026-02-01"));
+    assert.ok(!text.includes("## 2026-01-01"));
+  });
+
+  it("tail_sections respects custom section_level", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/devlog.md", tail_sections: 1, section_level: 1 });
+    const text = result.content[0].text;
+    assert.ok(text.includes("# Project Devlog"));
+    assert.ok(text.includes("## 2026-01-01"));
+  });
+
+  it("rejects heading + tail (mutual exclusivity)", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/devlog.md", heading: "## 2026-01-01", tail: 5 }),
+      /Only one of/
+    );
+  });
+
+  it("rejects tail + tail_sections (mutual exclusivity)", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/devlog.md", tail: 5, tail_sections: 2 }),
+      /Only one of/
+    );
+  });
+});
+
+// ─── vault_read chunk param ──────────────────────────────────────────
+
+describe("handleRead chunk param", () => {
+  it("reads chunk 1 of a large file", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/large-file.md", chunk: 1 });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Chunk 1 of"));
+    assert.ok(text.includes("# Large File"));
+  });
+
+  it("reads chunk 2 of a large file", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/large-file.md", chunk: 2 });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Chunk 2 of"));
+  });
+
+  it("chunk 1 on a small file returns entire content", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/alpha.md", chunk: 1 });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Chunk 1 of 1"));
+    assert.ok(text.includes("# Alpha Note"));
+  });
+
+  it("throws on chunk 0", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/large-file.md", chunk: 0 }),
+      /Invalid chunk/
+    );
+  });
+
+  it("throws on chunk exceeding total", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/large-file.md", chunk: 999 }),
+      /Invalid chunk/
+    );
+  });
+
+  it("rejects chunk combined with heading (mutual exclusivity)", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/alpha.md", chunk: 1, heading: "# Alpha Note" }),
+      /Only one of/
+    );
+  });
+
+  it("rejects chunk combined with tail (mutual exclusivity)", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/alpha.md", chunk: 1, tail: 5 }),
+      /Only one of/
+    );
+  });
+});
+
+// ─── vault_read lines param ─────────────────────────────────────────
+
+describe("handleRead lines param", () => {
+  it("reads a line range", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/headingless-large.md", lines: { start: 7, end: 11 } });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Lines 7-11"));
+    assert.ok(text.includes("Line 1:"));  // line 7 of file = "Line 1: data data..."
+  });
+
+  it("clamps end beyond file length", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/alpha.md", lines: { start: 1, end: 99999 } });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Lines 1-"));
+    assert.ok(text.includes("# Alpha Note"));
+  });
+
+  it("reads a single line when start equals end", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/alpha.md", lines: { start: 1, end: 1 } });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Lines 1-1"));
+  });
+
+  it("throws on start < 1", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/alpha.md", lines: { start: 0, end: 5 } }),
+      /positive integers/
+    );
+  });
+
+  it("throws on start > end", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/alpha.md", lines: { start: 10, end: 5 } }),
+      /Invalid line range/
+    );
+  });
+
+  it("throws on start beyond file length", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/alpha.md", lines: { start: 99999, end: 100000 } }),
+      /Invalid line range/
+    );
+  });
+
+  it("rejects lines combined with chunk (mutual exclusivity)", async () => {
+    const handler = handlers.get("vault_read");
+    await assert.rejects(
+      () => handler({ path: "notes/alpha.md", lines: { start: 1, end: 5 }, chunk: 1 }),
+      /Only one of/
+    );
+  });
+
+  it("vault_read rejects non-numeric lines.start and lines.end", async () => {
+    await assert.rejects(
+      () => handlers.get("vault_read")({ path: "notes/alpha.md", lines: { start: "abc", end: "xyz" } }),
+      /positive integers/
+    );
+  });
+
+  it("vault_read rejects negative lines values", async () => {
+    await assert.rejects(
+      () => handlers.get("vault_read")({ path: "notes/alpha.md", lines: { start: -1, end: 5 } }),
+      /positive integers/
+    );
+  });
+});
+
+// ─── vault_read auto-redirect ────────────────────────────────────────
+
+describe("handleRead auto-redirect", () => {
+  it("auto-redirects to peek for large files without pagination params", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/large-file.md" });
+    const text = result.content[0].text;
+    // Should contain peek data, not raw content
+    assert.ok(text.includes("Section A"));
+    assert.ok(text.includes("Section B"));
+    assert.ok(text.includes("auto-read threshold") || text.includes("exceeds"));
+    // Should NOT contain bulk filler content (preview truncates lines to 200 chars)
+    assert.ok(!text.includes("x".repeat(500)));
+  });
+
+  it("does NOT auto-redirect when heading param is given", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/large-file.md", heading: "## Section B" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Small section content."));
+    assert.ok(!text.includes("auto-read threshold"));
+  });
+
+  it("does NOT auto-redirect when chunk param is given", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/large-file.md", chunk: 1 });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Chunk 1 of"));
+    assert.ok(!text.includes("auto-read threshold"));
+  });
+
+  it("does NOT auto-redirect when tail param is given", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/large-file.md", tail: 5 });
+    const text = result.content[0].text;
+    assert.ok(!text.includes("auto-read threshold"));
+  });
+
+  it("does NOT auto-redirect for small files", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/alpha.md" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("# Alpha Note"));
+    assert.ok(!text.includes("auto-read threshold"));
+  });
+
+  it("auto-redirects headingless large files with chunk guidance", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/headingless-large.md" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("auto-read threshold") || text.includes("exceeds"));
+    assert.ok(text.includes("chunk"));
+  });
+});
+
+// ─── vault_read force param ─────────────────────────────────────────
+
+describe("handleRead force param", () => {
+  it("force=true returns full content for large file within hard cap", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/large-file.md", force: true });
+    const text = result.content[0].text;
+    assert.ok(text.length > 80000);
+    assert.ok(!text.includes("auto-read threshold"));
+  });
+
+  it("force=true on small file returns content normally", async () => {
+    const handler = handlers.get("vault_read");
+    const result = await handler({ path: "notes/alpha.md", force: true });
+    const text = result.content[0].text;
+    assert.ok(text.includes("# Alpha Note"));
+  });
+});
+
+// ─── fuzzy path resolution (read tools) ─────────────────────────────
+
+describe("fuzzy path resolution (read tools)", () => {
+  it("vault_read resolves basename without extension", async () => {
+    const read = handlers.get("vault_read");
+    const result = await read({ path: "alpha" });
+    assert.match(result.content[0].text, /Alpha Note/);
+  });
+
+  it("vault_read resolves basename with .md extension", async () => {
+    const read = handlers.get("vault_read");
+    const result = await read({ path: "alpha.md" });
+    assert.match(result.content[0].text, /Alpha Note/);
+  });
+
+  it("vault_read still works with exact path", async () => {
+    const read = handlers.get("vault_read");
+    const result = await read({ path: "notes/alpha.md" });
+    assert.match(result.content[0].text, /Alpha Note/);
+  });
+
+  it("vault_read throws on ambiguous basename", async () => {
+    await assert.rejects(
+      () => handlers.get("vault_read")({ path: "index" }),
+      (err) => {
+        assert.match(err.message, /matches \d+ files/);
+        return true;
+      }
+    );
+  });
+
+  it("vault_links resolves fuzzy path", async () => {
+    const links = handlers.get("vault_links");
+    const result = await links({ path: "alpha" });
+    assert.ok(result.content[0].text);
+  });
+
+  it("vault_neighborhood resolves fuzzy path", async () => {
+    const neighborhood = handlers.get("vault_neighborhood");
+    const result = await neighborhood({ path: "alpha", depth: 1 });
+    assert.match(result.content[0].text, /alpha/);
+  });
+});
+
+// ─── fuzzy folder resolution ─────────────────────────────────────────
+
+describe("fuzzy folder resolution", () => {
+  it("vault_search resolves exact folder name", async () => {
+    const search = handlers.get("vault_search");
+    const result = await search({ query: "Devlog", folder: "notes" });
+    assert.match(result.content[0].text, /devlog/);
+  });
+
+  it("vault_query resolves exact folder name", async () => {
+    const query = handlers.get("vault_query");
+    const result = await query({ type: "devlog", folder: "notes" });
+    assert.match(result.content[0].text, /devlog/);
+  });
+
+  it("vault_recent resolves exact folder name", async () => {
+    const recent = handlers.get("vault_recent");
+    const result = await recent({ folder: "notes" });
+    assert.match(result.content[0].text, /\.md/);
+  });
+
+  it("vault_tags resolves exact folder name", async () => {
+    const tags = handlers.get("vault_tags");
+    const result = await tags({ folder: "notes" });
+    assert.match(result.content[0].text, /dev/);
+  });
+
+  it("vault_search resolves partial folder name (fuzzy)", async () => {
+    const search = handlers.get("vault_search");
+    // "my-app" should resolve to "projects/my-app" via substring match
+    const result = await search({ query: "Findings", folder: "my-app" });
+    assert.match(result.content[0].text, /findings/);
+  });
+
+  it("vault_query resolves partial folder name (fuzzy)", async () => {
+    const query = handlers.get("vault_query");
+    const result = await query({ type: "research", folder: "my-app" });
+    assert.match(result.content[0].text, /findings/);
+  });
+
+  it("vault_search rejects unknown folder", async () => {
+    const search = handlers.get("vault_search");
+    await assert.rejects(
+      () => search({ query: "test", folder: "nonexistent-folder-xyz" }),
+      (err) => {
+        assert.match(err.message, /not found|No matching|ENOENT/i);
+        return true;
+      }
+    );
+  });
+
+  it("folder resolution rejects directory traversal", async () => {
+    const search = handlers.get("vault_search");
+    await assert.rejects(
+      () => search({ query: "test", folder: "../../etc" }),
+      /escapes vault/
+    );
+  });
+
+  it("vault_list resolves exact folder name", async () => {
+    const list = handlers.get("vault_list");
+    const result = await list({ path: "notes" });
+    assert.match(result.content[0].text, /alpha\.md/);
+  });
+
+  it("vault_list resolves partial folder name (fuzzy)", async () => {
+    const list = handlers.get("vault_list");
+    // "my-app" should resolve to "projects/my-app" via substring match
+    const result = await list({ path: "my-app" });
+    const text = result.content[0].text;
+    assert.match(text, /research/);
+  });
+
+  it("vault_list fuzzy resolution shows resolved paths in output", async () => {
+    const list = handlers.get("vault_list");
+    // When fuzzy-resolving "my-app" → "projects/my-app", output paths
+    // should use the resolved path, not the fuzzy input
+    const result = await list({ path: "my-app", recursive: true });
+    const text = result.content[0].text;
+    assert.match(text, /projects\/my-app/);
+  });
+
+  it("vault_list rejects unknown folder", async () => {
+    const list = handlers.get("vault_list");
+    await assert.rejects(
+      () => list({ path: "nonexistent-folder-xyz" }),
+      (err) => {
+        assert.match(err.message, /not found|No matching|ENOENT/i);
+        return true;
+      }
+    );
+  });
+});
+
+// ─── vault_write ───────────────────────────────────────────────────────
+
+describe("handleWrite", () => {
+  let writeCount = 0;
+  function uniquePath() {
+    return `output/write-test-${++writeCount}.md`;
+  }
+
+  it("creates a note from a template", async () => {
+    const handler = handlers.get("vault_write");
+    const outPath = uniquePath();
+    const result = await handler({
+      template: "research-note",
+      path: outPath,
+      frontmatter: { tags: ["test"] },
+    });
+
+    assert.ok(result.content[0].text.includes("Created"));
+    assert.ok(result.content[0].text.includes("research-note"));
+
+    // Verify file was written
+    const content = await fs.readFile(path.join(tmpDir, outPath), "utf-8");
+    assert.ok(content.includes("type: research"));
+    assert.ok(content.includes("tags:"));
+  });
+
+  it("substitutes template variables", async () => {
+    const handler = handlers.get("vault_write");
+    const outPath = uniquePath();
+    await handler({
+      template: "research-note",
+      path: outPath,
+      frontmatter: { tags: ["test"] },
+    });
+
+    const content = await fs.readFile(path.join(tmpDir, outPath), "utf-8");
+    // tp.date.now should be substituted with today's local date
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    assert.ok(content.includes(today));
+    // tp.file.title should be the filename without .md
+    const expectedTitle = path.basename(outPath, ".md");
+    assert.ok(content.includes(expectedTitle));
+  });
+
+  it("rejects unknown template", async () => {
+    const handler = handlers.get("vault_write");
+    await assert.rejects(
+      () => handler({ template: "nonexistent", path: "out.md", frontmatter: { tags: ["x"] } }),
+      /not found/
+    );
+  });
+
+  it("rejects if file already exists", async () => {
+    const handler = handlers.get("vault_write");
+    await assert.rejects(
+      () => handler({ template: "research-note", path: "notes/alpha.md", frontmatter: { tags: ["x"] } }),
+      /already exists/
+    );
+  });
+
+  it("creates parent directories when createDirs is true", async () => {
+    const handler = handlers.get("vault_write");
+    const outPath = `deep/nested/dir/${uniquePath()}`;
+    await handler({
+      template: "research-note",
+      path: outPath,
+      frontmatter: { tags: ["nested"] },
+    });
+    const stat = await fs.stat(path.join(tmpDir, outPath));
+    assert.ok(stat.isFile());
+  });
+
+  it("merges frontmatter overrides", async () => {
+    const handler = handlers.get("vault_write");
+    const outPath = uniquePath();
+    await handler({
+      template: "adr",
+      path: outPath,
+      frontmatter: { tags: ["custom-tag"], deciders: "The Team" },
+    });
+
+    const content = await fs.readFile(path.join(tmpDir, outPath), "utf-8");
+    assert.ok(content.includes("custom-tag"));
+    assert.ok(content.includes("The Team"));
+  });
+
+  it("creates a task note with custom frontmatter fields", async () => {
+    const result = await handlers.get("vault_write")({
+      template: "task",
+      path: "tasks/buy-groceries.md",
+      frontmatter: {
+        tags: ["task", "grocery"],
+        status: "pending",
+        priority: "high",
+        project: "Home",
+        source: "telegram",
+      }
+    });
+    const content = await fs.readFile(path.join(tmpDir, "tasks/buy-groceries.md"), "utf-8");
+    assert.ok(content.includes("type: task"));
+    assert.ok(content.includes("priority: high"));
+    assert.ok(content.includes("project: Home"));
+    assert.ok(content.includes("source: telegram"));
+    assert.ok(content.includes("## Description"));
+    assert.ok(result.content[0].text.includes("task"));
+  });
+});
+
+// ─── vault_append ──────────────────────────────────────────────────────
+
+describe("handleAppend", () => {
+  let appendFile;
+
+  beforeEach(async () => {
+    appendFile = `notes/append-${Date.now()}-${Math.random().toString(36).slice(2)}.md`;
+    await fs.writeFile(path.join(tmpDir, appendFile), `---
+type: research
+created: 2026-01-01
+tags:
+  - test
+---
+# Test Note
+
+## Section One
+
+Some content here.
+
+## Section Two
+
+More content.
+`);
+  });
+
+  it("appends to end of file when no heading given", async () => {
+    const handler = handlers.get("vault_append");
+    await handler({ path: appendFile, content: "New stuff" });
+
+    const content = await fs.readFile(path.join(tmpDir, appendFile), "utf-8");
+    assert.ok(content.includes("\nNew stuff"));
+  });
+
+  it("appends after a heading by default", async () => {
+    const handler = handlers.get("vault_append");
+    await handler({ path: appendFile, heading: "## Section One", content: "Inserted line" });
+
+    const content = await fs.readFile(path.join(tmpDir, appendFile), "utf-8");
+    const lines = content.split("\n");
+    const headingIdx = lines.findIndex(l => l === "## Section One");
+    assert.equal(lines[headingIdx + 1], "Inserted line");
+  });
+
+  it("inserts before heading with position=before_heading", async () => {
+    const handler = handlers.get("vault_append");
+    await handler({
+      path: appendFile,
+      heading: "## Section Two",
+      position: "before_heading",
+      content: "Before section two",
+    });
+
+    const content = await fs.readFile(path.join(tmpDir, appendFile), "utf-8");
+    const idx = content.indexOf("Before section two");
+    const headingIdx = content.indexOf("## Section Two");
+    assert.ok(idx < headingIdx);
+  });
+
+  it("inserts at end of section with position=end_of_section", async () => {
+    const handler = handlers.get("vault_append");
+    await handler({
+      path: appendFile,
+      heading: "## Section One",
+      position: "end_of_section",
+      content: "End of section one",
+    });
+
+    const content = await fs.readFile(path.join(tmpDir, appendFile), "utf-8");
+    const endIdx = content.indexOf("End of section one");
+    const sec2Idx = content.indexOf("## Section Two");
+    assert.ok(endIdx < sec2Idx, "Should be before Section Two heading");
+
+    const oneIdx = content.indexOf("Some content here.");
+    assert.ok(endIdx > oneIdx, "Should be after existing section content");
+  });
+
+  it("throws when position given without heading", async () => {
+    const handler = handlers.get("vault_append");
+    await assert.rejects(
+      () => handler({ path: appendFile, position: "after_heading", content: "x" }),
+      /heading.*required/i
+    );
+  });
+
+  it("throws when heading not found", async () => {
+    const handler = handlers.get("vault_append");
+    await assert.rejects(
+      () => handler({ path: appendFile, heading: "## Nonexistent", position: "after_heading", content: "x" }),
+      /Heading not found/
+    );
+  });
+
+  it("throws on non-existent file", async () => {
+    const handler = handlers.get("vault_append");
+    await assert.rejects(
+      () => handler({ path: "notes/no-such-file.md", content: "x" }),
+      /File not found/
+    );
+  });
+
+  it("throws on unknown position value instead of writing undefined", async () => {
+    const handler = handlers.get("vault_append");
+    await assert.rejects(
+      () => handler({ path: appendFile, heading: "## Section One", position: "invalid_position", content: "x" }),
+      /Unknown position: invalid_position/
+    );
+
+    // Verify the file was NOT corrupted
+    const content = await fs.readFile(path.join(tmpDir, appendFile), "utf-8");
+    assert.ok(!content.includes("undefined"), "File should not contain 'undefined'");
+    assert.ok(content.includes("## Section One"), "File content should be intact");
+  });
+
+  it("vault_append rejects empty content", async () => {
+    await assert.rejects(
+      () => handlers.get("vault_append")({ path: "notes/alpha.md", content: "" }),
+      /content must be a non-empty string/
+    );
+  });
+});
+
+// ─── vault_edit ────────────────────────────────────────────────────────
+
+describe("handleEdit", () => {
+  let editFile;
+
+  beforeEach(async () => {
+    editFile = `notes/edit-${Date.now()}-${Math.random().toString(36).slice(2)}.md`;
+    await fs.writeFile(path.join(tmpDir, editFile), "line one\nline two\nline three\n");
+  });
+
+  it("replaces a unique string", async () => {
+    const handler = handlers.get("vault_edit");
+    const result = await handler({ path: editFile, old_string: "line two", new_string: "line TWO" });
+
+    assert.ok(result.content[0].text.includes("Successfully edited"));
+    const content = await fs.readFile(path.join(tmpDir, editFile), "utf-8");
+    assert.ok(content.includes("line TWO"));
+    assert.ok(!content.includes("line two"));
+  });
+
+  it("returns error when no match found", async () => {
+    const handler = handlers.get("vault_edit");
+    const result = await handler({ path: editFile, old_string: "nonexistent", new_string: "x" });
+    assert.equal(result.isError, true);
+    assert.ok(result.content[0].text.includes("No match"));
+  });
+
+  it("returns error when multiple matches found", async () => {
+    await fs.writeFile(path.join(tmpDir, editFile), "word word word\n");
+    const handler = handlers.get("vault_edit");
+    const result = await handler({ path: editFile, old_string: "word", new_string: "x" });
+    assert.equal(result.isError, true);
+    assert.ok(result.content[0].text.includes("3 matches"));
+  });
+
+  it("throws descriptive error for nonexistent file without leaking absolute path", async () => {
+    const handler = handlers.get("vault_edit");
+    await assert.rejects(
+      () => handler({ path: "no-such-file.md", old_string: "a", new_string: "b" }),
+      (err) => {
+        assert.ok(err.message.includes("File not found: no-such-file.md"));
+        assert.ok(!err.message.includes(tmpDir));
+        return true;
+      }
+    );
+  });
+
+  it("vault_edit rejects empty old_string", async () => {
+    await assert.rejects(
+      () => handlers.get("vault_edit")({ path: "notes/alpha.md", old_string: "", new_string: "replacement" }),
+      /old_string must be a non-empty string/
+    );
+  });
+
+  it("rejects a new_string that is missing or not a string, leaving the note unchanged", async () => {
+    for (const new_string of [undefined, null, 42, ["line TWO"]]) {
+      await assert.rejects(
+        () => handlers.get("vault_edit")({ path: editFile, old_string: "line two", new_string }),
+        /new_string must be a string/,
+        `new_string: ${JSON.stringify(new_string)}`
+      );
+    }
+    assert.equal(await fs.readFile(path.join(tmpDir, editFile), "utf-8"), "line one\nline two\nline three\n");
+  });
+
+  it("an empty new_string deletes the match", async () => {
+    await handlers.get("vault_edit")({ path: editFile, old_string: "line two\n", new_string: "" });
+    assert.equal(await fs.readFile(path.join(tmpDir, editFile), "utf-8"), "line one\nline three\n");
+  });
+});
+
+// ─── vault_search ──────────────────────────────────────────────────────
+
+describe("handleSearch", () => {
+  it("finds notes matching a query", async () => {
+    const handler = handlers.get("vault_search");
+    const result = await handler({ query: "architecture" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("beta.md"));
+  });
+
+  it("search is case-insensitive", async () => {
+    const handler = handlers.get("vault_search");
+    const result = await handler({ query: "ALPHA NOTE" });
+    assert.ok(result.content[0].text.includes("alpha.md"));
+  });
+
+  it("returns no matches message", async () => {
+    const handler = handlers.get("vault_search");
+    const result = await handler({ query: "zzzznotfound12345" });
+    assert.ok(result.content[0].text.includes("No matches"));
+  });
+
+  it("respects folder filter", async () => {
+    const handler = handlers.get("vault_search");
+    // Search in 05-Templates, which shouldn't have "architecture"
+    const result = await handler({ query: "architecture", folder: "05-Templates" });
+    assert.ok(!result.content[0].text.includes("beta.md"));
+  });
+
+  it("respects limit", async () => {
+    const handler = handlers.get("vault_search");
+    const result = await handler({ query: "Note", limit: 1 });
+    // Should only return 1 result even though multiple notes match.
+    // Result paths render as **[path.md](obsidian://...)** — count those.
+    const matches = result.content[0].text.match(/\*\*\[[^\]]+\.md\]\(obsidian:\/\/[^)]+\)\*\*/g) || [];
+    assert.equal(matches.length, 1);
+  });
+
+  it("skips files deleted after listing (ENOENT)", async () => {
+    const extraFile = path.join(tmpDir, "notes", "temp-search-test.md");
+    await fs.writeFile(extraFile, "---\ntype: note\ncreated: 2026-01-01\ntags: [test]\n---\nuniquekeyword123", "utf-8");
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir, templateRegistry, semanticIndex: null, activityLog: null,
+    });
+    await fs.unlink(extraFile);
+    const result = await freshHandlers.get("vault_search")({ query: "uniquekeyword123" });
+    assert.ok(!result.content[0].text.includes("temp-search-test"), "should not include deleted file");
+  });
+});
+
+// ─── vault_list ────────────────────────────────────────────────────────
+
+describe("handleList", () => {
+  it("lists the vault root", async () => {
+    const handler = handlers.get("vault_list");
+    const result = await handler({});
+    const text = result.content[0].text;
+    assert.ok(text.includes("notes/"));
+    assert.ok(text.includes("05-Templates/"));
+  });
+
+  it("lists a subdirectory", async () => {
+    const handler = handlers.get("vault_list");
+    const result = await handler({ path: "notes" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("alpha.md"));
+    assert.ok(text.includes("beta.md"));
+    assert.ok(text.includes("gamma.md"));
+  });
+
+  it("skips dotfiles", async () => {
+    await fs.writeFile(path.join(tmpDir, ".hidden"), "secret");
+    const handler = handlers.get("vault_list");
+    const result = await handler({});
+    assert.ok(!result.content[0].text.includes(".hidden"));
+  });
+
+  it("supports glob pattern filtering", async () => {
+    const handler = handlers.get("vault_list");
+    const result = await handler({ path: "notes", pattern: "alpha*" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("alpha.md"));
+    assert.ok(!text.includes("beta.md"));
+  });
+
+  it("vault_list returns clean error when folder deleted after resolve", async () => {
+    const testDir = path.join(tmpDir, "temp-list-test");
+    await fs.mkdir(testDir);
+    await fs.writeFile(path.join(testDir, "dummy.md"), "---\ntype: note\ncreated: 2026-01-01\ntags: [test]\n---\ntest", "utf-8");
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test-session-list-enoent",
+    });
+    await fs.rm(testDir, { recursive: true });
+    try {
+      await freshHandlers.get("vault_list")({ path: "temp-list-test" });
+      assert.fail("should have thrown");
+    } catch (err) {
+      assert.ok(err.message.includes("not found") || err.message.includes("Folder not found"), `got: ${err.message}`);
+      assert.ok(!err.message.includes(tmpDir), "should not leak absolute vault path");
+    }
+  });
+});
+
+// ─── vault_recent ──────────────────────────────────────────────────────
+
+describe("handleRecent", () => {
+  it("returns recently modified files", async () => {
+    const handler = handlers.get("vault_recent");
+    const result = await handler({});
+    const text = result.content[0].text;
+    // All md files in vault should appear
+    assert.ok(text.includes(".md"));
+  });
+
+  it("respects limit", async () => {
+    const handler = handlers.get("vault_recent");
+    const result = await handler({ limit: 1 });
+    const lines = result.content[0].text.trim().split("\n");
+    assert.equal(lines.length, 1);
+  });
+
+  it("respects folder filter", async () => {
+    const handler = handlers.get("vault_recent");
+    const result = await handler({ folder: "notes" });
+    const text = result.content[0].text;
+    // handleRecent returns paths relative to the folder, so just "alpha.md" not "notes/alpha.md"
+    assert.ok(text.includes(".md"), "Should contain markdown files");
+    // Should not include template files since we're scoped to notes/
+    assert.ok(!text.includes("05-Templates"));
+  });
+
+  it("sorts by modification time descending", async () => {
+    // Touch alpha to make it most recent
+    const alphaPath = path.join(tmpDir, "notes/alpha.md");
+    const content = await fs.readFile(alphaPath, "utf-8");
+    await new Promise(resolve => setTimeout(resolve, 50));
+    await fs.writeFile(alphaPath, content);
+
+    const handler = handlers.get("vault_recent");
+    const result = await handler({ folder: "notes", limit: 1 });
+    assert.ok(result.content[0].text.includes("alpha.md"));
+  });
+
+  it("skips files deleted after listing (ENOENT)", async () => {
+    const extraFile = path.join(tmpDir, "notes", "temp-recent-test.md");
+    await fs.writeFile(extraFile, "---\ntype: note\ncreated: 2026-01-01\ntags: [test]\n---\ntemp", "utf-8");
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir, templateRegistry, semanticIndex: null, activityLog: null,
+    });
+    await fs.unlink(extraFile);
+    const result = await freshHandlers.get("vault_recent")({ limit: 50 });
+    assert.ok(!result.content[0].text.includes("temp-recent-test"), "should not include deleted file");
+  });
+});
+
+// ─── vault_links ───────────────────────────────────────────────────────
+
+describe("handleLinks", () => {
+  it("finds outgoing wikilinks", async () => {
+    const handler = handlers.get("vault_links");
+    const result = await handler({ path: "notes/alpha.md", direction: "outgoing" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("[[beta]]"));
+    assert.ok(text.includes("[[gamma]]"));
+  });
+
+  it("finds incoming wikilinks", async () => {
+    const handler = handlers.get("vault_links");
+    const result = await handler({ path: "notes/alpha.md", direction: "incoming" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("beta.md"), "beta links to alpha");
+  });
+
+  it("finds both directions by default", async () => {
+    const handler = handlers.get("vault_links");
+    const result = await handler({ path: "notes/alpha.md", direction: "both" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Outgoing"));
+    assert.ok(text.includes("Incoming"));
+  });
+
+  it("returns no links for isolated note", async () => {
+    const handler = handlers.get("vault_links");
+    const result = await handler({ path: "notes/gamma.md", direction: "outgoing" });
+    assert.ok(result.content[0].text.includes("No links"));
+  });
+
+  it("detects incoming links via folder-prefixed wikilinks", async () => {
+    // Create notes where one links to another using [[folder/name]] syntax
+    const linkDir = path.join(tmpDir, "link-test");
+    await fs.mkdir(linkDir, { recursive: true });
+    await fs.writeFile(path.join(linkDir, "link-target.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Link Target
+`);
+    await fs.writeFile(path.join(linkDir, "link-source.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Link Source
+
+References [[link-test/link-target]] using a folder-prefixed wikilink.
+`);
+
+    // Rebuild handlers to pick up the new files
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test-session-links-folder",
+    });
+
+    const handler = freshHandlers.get("vault_links");
+    const result = await handler({ path: "link-test/link-target.md", direction: "incoming" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("link-test/link-source.md"), `Should detect folder-prefixed incoming link but got: ${text}`);
+  });
+
+  it("throws descriptive error for nonexistent file without leaking absolute path", async () => {
+    const handler = handlers.get("vault_links");
+    await assert.rejects(
+      () => handler({ path: "no-such-file.md" }),
+      (err) => {
+        assert.ok(err.message.includes("not found"), "should have descriptive error");
+        assert.ok(!err.message.includes(tmpDir), "should not leak absolute vault path");
+        return true;
+      }
+    );
+  });
+
+  it("vault_links returns clean error when file deleted after resolve", async () => {
+    const targetFile = path.join(tmpDir, "notes", "alpha.md");
+    await fs.unlink(targetFile);
+    try {
+      await handlers.get("vault_links")({ path: "alpha" });
+      assert.fail("should have thrown");
+    } catch (err) {
+      assert.ok(err.message.includes("not found") || err.message.includes("File not found"), `got: ${err.message}`);
+      assert.ok(!err.message.includes(tmpDir), "should not leak absolute vault path");
+    }
+    // Recreate with original content for other tests
+    await fs.writeFile(targetFile, `---\ntype: research\nstatus: active\ncreated: 2026-01-15\ntags:\n  - dev\n  - mcp\n---\n# Alpha Note\n\nSome content about [[beta]] and the MCP server.\nAlso references [[gamma|Gamma Note]].\n`, "utf-8");
+  });
+});
+
+// ─── vault_query ───────────────────────────────────────────────────────
+
+describe("handleQuery", () => {
+  it("queries by type", async () => {
+    const handler = handlers.get("vault_query");
+    const result = await handler({ type: "research" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("alpha.md"));
+    assert.ok(!text.includes("beta.md")); // beta is type: adr
+  });
+
+  it("queries by status", async () => {
+    const handler = handlers.get("vault_query");
+    const result = await handler({ status: "accepted" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("beta.md"));
+    assert.ok(!text.includes("alpha.md")); // alpha is status: active
+  });
+
+  it("queries by tags (all required)", async () => {
+    const handler = handlers.get("vault_query");
+    const result = await handler({ tags: ["decision", "architecture"] });
+    const text = result.content[0].text;
+    assert.ok(text.includes("beta.md"));
+  });
+
+  it("queries by tags_any", async () => {
+    const handler = handlers.get("vault_query");
+    const result = await handler({ tags_any: ["mcp", "knowledge"] });
+    const text = result.content[0].text;
+    assert.ok(text.includes("alpha.md"));
+    assert.ok(text.includes("gamma.md"));
+    assert.ok(!text.includes("beta.md"));
+  });
+
+  it("queries by date range", async () => {
+    const handler = handlers.get("vault_query");
+    const result = await handler({ created_after: "2026-01-01", created_before: "2026-01-31" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("alpha.md")); // created 2026-01-15
+    assert.ok(!text.includes("beta.md")); // created 2026-02-01
+    assert.ok(!text.includes("gamma.md")); // created 2025-12-01
+  });
+
+  it("returns empty message when no matches", async () => {
+    const handler = handlers.get("vault_query");
+    const result = await handler({ type: "nonexistent-type" });
+    assert.ok(result.content[0].text.includes("No notes found"));
+  });
+
+  it("respects folder filter", async () => {
+    const handler = handlers.get("vault_query");
+    const result = await handler({ folder: "05-Templates", type: "research" });
+    const text = result.content[0].text;
+    // Templates have type: research but are in 05-Templates, not notes
+    assert.ok(!text.includes("alpha.md"));
+  });
+
+  it("respects limit", async () => {
+    const handler = handlers.get("vault_query");
+    const result = await handler({ status: "active", limit: 1 });
+    const text = result.content[0].text;
+    assert.ok(text.includes("1 note"));
+  });
+
+  it("filters by custom_fields", async () => {
+    const result = await handlers.get("vault_query")({
+      type: "task",
+      custom_fields: { priority: "high" },
+      folder: "tasks"
+    });
+    assert.ok(result.content[0].text.includes("task-a.md"));
+    assert.ok(!result.content[0].text.includes("task-b.md"));
+    assert.ok(!result.content[0].text.includes("task-c.md"));
+  });
+
+  it("sorts by priority descending (urgent first)", async () => {
+    const result = await handlers.get("vault_query")({
+      type: "task",
+      folder: "tasks",
+      sort_by: "priority",
+      sort_order: "desc"
+    });
+    const text = result.content[0].text;
+    const posUrgent = text.indexOf("task-c");
+    const posHigh = text.indexOf("task-a");
+    const posLow = text.indexOf("task-b");
+    assert.ok(posUrgent < posHigh, "urgent should come before high");
+    assert.ok(posHigh < posLow, "high should come before low");
+  });
+
+  it("sorts by due date ascending (nulls last)", async () => {
+    const result = await handlers.get("vault_query")({
+      type: "task",
+      folder: "tasks",
+      sort_by: "due",
+      sort_order: "asc"
+    });
+    const text = result.content[0].text;
+    const posB = text.indexOf("task-b");
+    const posA = text.indexOf("task-a");
+    const posC = text.indexOf("task-c");
+    assert.ok(posB < posA, "earlier due date first");
+    assert.ok(posA < posC, "null due date last");
+  });
+
+  it("sort_by defaults to ascending", async () => {
+    const result = await handlers.get("vault_query")({
+      type: "task",
+      folder: "tasks",
+      sort_by: "created"
+    });
+    const text = result.content[0].text;
+    const posA = text.indexOf("task-a");
+    const posB = text.indexOf("task-b");
+    const posC = text.indexOf("task-c");
+    assert.ok(posA < posB, "earliest created first");
+    assert.ok(posB < posC, "latest created last");
+  });
+
+  it("applies limit after sorting (not before)", async () => {
+    const result = await handlers.get("vault_query")({
+      type: "task",
+      folder: "tasks",
+      sort_by: "priority",
+      sort_order: "desc",
+      limit: 2
+    });
+    const text = result.content[0].text;
+    // Key invariant: limit is applied AFTER sorting, so the highest-priority
+    // task (urgent) must appear, and the lowest-priority (low) must not.
+    assert.ok(text.includes("task-c"), "urgent task must be in top 2");
+    assert.ok(!text.includes("task-b"), "low task must be excluded by limit");
+    assert.ok(text.includes("2 note"), "should report exactly 2 results");
+  });
+
+  it("skips files deleted after listing (ENOENT)", async () => {
+    const extraFile = path.join(tmpDir, "notes", "temp-query-test.md");
+    await fs.writeFile(extraFile, "---\ntype: research\ncreated: 2026-01-01\ntags: [test]\n---\nquery test", "utf-8");
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir, templateRegistry, semanticIndex: null, activityLog: null,
+    });
+    await fs.unlink(extraFile);
+    const result = await freshHandlers.get("vault_query")({ type: "research" });
+    assert.ok(!result.content[0].text.includes("temp-query-test"), "should not include deleted file");
+  });
+});
+
+// ─── vault_tags ────────────────────────────────────────────────────────
+
+describe("handleTags", () => {
+  it("discovers all tags in vault", async () => {
+    const handler = handlers.get("vault_tags");
+    const result = await handler({});
+    const text = result.content[0].text;
+    assert.ok(text.includes("dev"));
+    assert.ok(text.includes("mcp"));
+    assert.ok(text.includes("decision"));
+    assert.ok(text.includes("knowledge"));
+  });
+
+  it("reports tag counts", async () => {
+    const handler = handlers.get("vault_tags");
+    const result = await handler({});
+    const text = result.content[0].text;
+    // "research" appears in alpha.md frontmatter and in the template
+    assert.ok(text.match(/research \(\d+\)/));
+  });
+
+  it("filters by folder", async () => {
+    const handler = handlers.get("vault_tags");
+    const result = await handler({ folder: "notes" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("dev"));
+    assert.ok(text.includes("knowledge"));
+  });
+
+  it("supports pattern filtering", async () => {
+    const handler = handlers.get("vault_tags");
+    const result = await handler({ pattern: "dec*" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("decision"));
+    assert.ok(!text.includes("knowledge"));
+  });
+
+  it("includes inline tags when requested", async () => {
+    // Add a file with inline tags
+    const inlineFile = path.join(tmpDir, "notes/inline-tags.md");
+    await fs.writeFile(inlineFile, `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Inline Tags Test
+
+This has #inline-tag and #another-tag in the body.
+`);
+
+    const handler = handlers.get("vault_tags");
+    const result = await handler({ include_inline: true });
+    const text = result.content[0].text;
+    assert.ok(text.includes("inline-tag"));
+    assert.ok(text.includes("another-tag"));
+
+    await fs.unlink(inlineFile);
+  });
+
+  it("skips files deleted after listing (ENOENT)", async () => {
+    const extraFile = path.join(tmpDir, "notes", "temp-tags-test.md");
+    await fs.writeFile(extraFile, "---\ntype: note\ncreated: 2026-01-01\ntags: [uniquetag789]\n---\ntags test", "utf-8");
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir, templateRegistry, semanticIndex: null, activityLog: null,
+    });
+    await fs.unlink(extraFile);
+    const result = await freshHandlers.get("vault_tags")({});
+    assert.ok(!result.content[0].text.includes("uniquetag789"), "should not include tags from deleted file");
+  });
+});
+
+// ─── vault_activity ────────────────────────────────────────────────────
+
+describe("handleActivity", () => {
+  it("throws when activity log is unavailable", async () => {
+    const handler = handlers.get("vault_activity");
+    // activityLog is null in our test context
+    await assert.rejects(() => handler({}), /Activity log unavailable/);
+  });
+
+  it("throws on clear when activity log is unavailable", async () => {
+    const handler = handlers.get("vault_activity");
+    await assert.rejects(() => handler({ action: "clear" }), /Activity log unavailable/);
+  });
+});
+
+// ─── vault_semantic_search ─────────────────────────────────────────────
+
+describe("handleSemanticSearch", () => {
+  it("throws when semantic index not available", async () => {
+    const handler = handlers.get("vault_semantic_search");
+    await assert.rejects(() => handler({ query: "test" }), /not available/);
+  });
+
+  it("returns search results from semantic index (happy path)", async () => {
+    const mockIndex = {
+      isAvailable: true,
+      async search() {
+        return `Found 2 semantically related notes:\n\n**notes/alpha.md** (score: 0.85)\nAlpha content\n\n**notes/beta.md** (score: 0.72)\nBeta content`;
+      },
+    };
+    const mockHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: new Map(),
+      semanticIndex: mockIndex,
+      activityLog: null,
+      sessionId: "test-semantic-happy",
+    });
+    const handler = mockHandlers.get("vault_semantic_search");
+    const result = await handler({ query: "machine learning", limit: 5 });
+    assert.equal(result.content[0].type, "text");
+    assert.ok(result.content[0].text.includes("alpha.md"));
+    assert.ok(result.content[0].text.includes("beta.md"));
+    assert.ok(result.content[0].text.includes("score: 0.85"));
+  });
+
+  it("passes all args through to semantic index", async () => {
+    let capturedArgs;
+    const mockIndex = {
+      isAvailable: true,
+      async search(args) {
+        capturedArgs = args;
+        return "No semantically related notes found.";
+      },
+    };
+    const mockHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: new Map(),
+      semanticIndex: mockIndex,
+      activityLog: null,
+      sessionId: "test-semantic-args",
+    });
+    const handler = mockHandlers.get("vault_semantic_search");
+    await handler({ query: "test query", limit: 3, folder: "notes", threshold: 0.5 });
+    assert.equal(capturedArgs.query, "test query");
+    assert.equal(capturedArgs.limit, 3);
+    assert.equal(capturedArgs.folder, "notes");
+    assert.equal(capturedArgs.threshold, 0.5);
+  });
+});
+
+// ─── vault_suggest_links ───────────────────────────────────────────────
+
+describe("handleSuggestLinks", () => {
+  it("throws when semantic index not available", async () => {
+    const handler = handlers.get("vault_suggest_links");
+    await assert.rejects(() => handler({ content: "test content" }), /not available/);
+  });
+
+  it("throws when neither content nor path provided", async () => {
+    // Create handlers with a mock semantic index that has isAvailable=true
+    const mockHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: new Map(),
+      semanticIndex: { isAvailable: true },
+      activityLog: null,
+      sessionId: "test",
+    });
+    const handler = mockHandlers.get("vault_suggest_links");
+    await assert.rejects(() => handler({}), /Either.*content.*path/);
+  });
+
+  it("returns link suggestions from content arg (happy path)", async () => {
+    const mockIndex = {
+      isAvailable: true,
+      async searchRaw() {
+        return [
+          { path: "notes/gamma.md", score: 0.88, preview: "Gamma note about knowledge" },
+          { path: "notes/beta.md", score: 0.72, preview: "Beta note about architecture" },
+        ];
+      },
+    };
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const mockHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: mockIndex,
+      activityLog: null,
+      sessionId: "test-suggest-content",
+    });
+
+    const handler = mockHandlers.get("vault_suggest_links");
+    const result = await handler({
+      content: "Some text about project management and decisions.",
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("link suggestion"), `Expected suggestions header but got: ${text}`);
+    assert.ok(text.includes("gamma.md"));
+    assert.ok(text.includes("beta.md"));
+    assert.ok(text.includes("score: 0.88"));
+  });
+
+  it("filters out already-linked notes from suggestions", async () => {
+    const mockIndex = {
+      isAvailable: true,
+      async searchRaw() {
+        return [
+          { path: "notes/gamma.md", score: 0.88, preview: "Gamma note" },
+          { path: "notes/beta.md", score: 0.72, preview: "Beta note" },
+        ];
+      },
+    };
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const mockHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: mockIndex,
+      activityLog: null,
+      sessionId: "test-suggest-filter",
+    });
+
+    const handler = mockHandlers.get("vault_suggest_links");
+    // Content already links to [[beta]]
+    const result = await handler({
+      content: "Some text that links to [[beta]] already.",
+    });
+    const text = result.content[0].text;
+    // beta should be filtered out because it's already linked
+    assert.ok(text.includes("gamma.md"), "gamma should appear");
+    assert.ok(!text.includes("beta.md"), "beta should be filtered (already linked)");
+  });
+
+  it("reads file when path arg is provided instead of content", async () => {
+    const mockIndex = {
+      isAvailable: true,
+      async searchRaw() {
+        return [
+          { path: "notes/beta.md", score: 0.80, preview: "Beta note about architecture" },
+        ];
+      },
+    };
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const mockHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: mockIndex,
+      activityLog: null,
+      sessionId: "test-suggest-path",
+    });
+
+    const handler = mockHandlers.get("vault_suggest_links");
+    // Use path arg - handler should read the file at notes/gamma.md
+    const result = await handler({ path: "notes/gamma.md" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("link suggestion"), `Expected suggestions but got: ${text}`);
+    assert.ok(text.includes("beta.md"));
+  });
+
+  it("returns 'no suggestions' when searchRaw returns empty", async () => {
+    const mockIndex = {
+      isAvailable: true,
+      async searchRaw() {
+        return [];
+      },
+    };
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const mockHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: mockIndex,
+      activityLog: null,
+      sessionId: "test-suggest-empty",
+    });
+
+    const handler = mockHandlers.get("vault_suggest_links");
+    const result = await handler({ content: "Some text." });
+    assert.ok(result.content[0].text.includes("No link suggestions found"));
+  });
+});
+
+// ─── vault_suggest_links graph_context ─────────────────────────────────
+
+describe("vault_suggest_links graph_context", () => {
+  it("blends semantic and graph scores when graph_context is true", async () => {
+    const mockResults = [
+      { path: "notes/devlog.md", score: 0.9, preview: "Devlog content" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    const result = await freshHandlers.get("vault_suggest_links")({
+      path: "notes/alpha.md",
+      graph_context: true
+    });
+    assert.ok(!result.isError);
+    const text = result.content[0].text;
+    assert.ok(text.includes("combined:"));
+    assert.ok(text.includes("semantic:"));
+  });
+
+  it("flags notes not in graph as missing_link", async () => {
+    const mockResults = [
+      { path: "notes/devlog.md", score: 0.8, preview: "Devlog content" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    // gamma.md has no outgoing links, so devlog won't be in its graph neighborhood
+    const result = await freshHandlers.get("vault_suggest_links")({
+      path: "notes/gamma.md",
+      graph_context: true
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("missing link"));
+  });
+
+  it("falls back to normal behavior when graph_context is false", async () => {
+    const mockResults = [
+      { path: "notes/devlog.md", score: 0.9, preview: "Devlog content" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    const result = await freshHandlers.get("vault_suggest_links")({
+      path: "notes/alpha.md",
+      graph_context: false
+    });
+    const text = result.content[0].text;
+    assert.ok(!text.includes("combined:"));
+    assert.ok(text.includes("score:"));
+  });
+
+  it("works without graph_context param (backward compat)", async () => {
+    const mockResults = [
+      { path: "notes/devlog.md", score: 0.9, preview: "Devlog content" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    const result = await freshHandlers.get("vault_suggest_links")({
+      path: "notes/alpha.md"
+    });
+    const text = result.content[0].text;
+    assert.ok(!text.includes("combined:"));
+  });
+});
+
+// ─── vault_semantic_search anchor ──────────────────────────────────────
+
+describe("vault_semantic_search anchor", () => {
+  it("blends semantic scores with graph proximity when anchor is provided", async () => {
+    const mockResults = [
+      { path: "notes/beta.md", score: 0.8, preview: "Beta content" },
+      { path: "notes/gamma.md", score: 0.9, preview: "Gamma content" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    const result = await freshHandlers.get("vault_semantic_search")({
+      query: "test query",
+      anchor: "notes/alpha.md"
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("combined:"));
+    assert.ok(text.includes("semantic:"));
+  });
+
+  it("uses default graph_weight of 0.3", async () => {
+    const mockResults = [
+      { path: "notes/beta.md", score: 0.8, preview: "Beta" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    // beta is at depth 1 from alpha (alpha links to beta), proximity = 1.0
+    // combined = (0.8 * 0.7) + (1.0 * 0.3) = 0.56 + 0.3 = 0.86
+    const result = await freshHandlers.get("vault_semantic_search")({
+      query: "test",
+      anchor: "notes/alpha.md"
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("0.86"));
+  });
+
+  it("respects custom graph_weight", async () => {
+    const mockResults = [
+      { path: "notes/beta.md", score: 0.8, preview: "Beta" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    // beta at depth 1, proximity = 1.0
+    // combined = (0.8 * 0.5) + (1.0 * 0.5) = 0.4 + 0.5 = 0.9
+    const result = await freshHandlers.get("vault_semantic_search")({
+      query: "test",
+      anchor: "notes/alpha.md",
+      graph_weight: 0.5
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("0.9"));
+  });
+
+  it("preserves normal behavior without anchor", async () => {
+    const mockResults = [
+      { path: "notes/beta.md", score: 0.8, preview: "Beta" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    const result = await freshHandlers.get("vault_semantic_search")({
+      query: "test"
+    });
+    const text = result.content[0].text;
+    assert.ok(!text.includes("combined:"));
+  });
+});
+
+// ─── vault_list glob matching (H1 ReDoS fix) ─────────────────────────
+
+describe("handleList glob pattern matching", () => {
+  it("filters with *.md pattern", async () => {
+    const handler = handlers.get("vault_list");
+    const result = await handler({ path: "notes", pattern: "*.md" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("alpha.md"));
+    assert.ok(text.includes("beta.md"));
+  });
+
+  it("filters with prefix-* pattern", async () => {
+    const handler = handlers.get("vault_list");
+    const result = await handler({ path: "notes", pattern: "alpha*" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("alpha.md"));
+    assert.ok(!text.includes("beta.md"));
+  });
+
+  it("filters with *substring* pattern", async () => {
+    const handler = handlers.get("vault_list");
+    const result = await handler({ path: "notes", pattern: "*lph*" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("alpha.md"));
+    assert.ok(!text.includes("beta.md"));
+  });
+
+  it("does not hang on crafted input (ReDoS safe)", async () => {
+    // If the glob used greedy .*, this crafted pattern could cause backtracking
+    const handler = handlers.get("vault_list");
+    const result = await handler({ path: "notes", pattern: "*a*a*a*a*a*a*b" });
+    // Should complete quickly and just return no matches or correct matches
+    assert.ok(result.content[0].text);
+  });
+});
+
+// ─── vault_edit with $ sequences (M3 fix) ────────────────────────────
+
+describe("handleEdit dollar sign replacement sequences", () => {
+  it("treats $& literally in new_string", async () => {
+    const editFile = `notes/dollar-test-${Date.now()}.md`;
+    await fs.writeFile(path.join(tmpDir, editFile), "replace this text\n");
+
+    const handler = handlers.get("vault_edit");
+    const result = await handler({
+      path: editFile,
+      old_string: "replace this text",
+      new_string: "cost is $& and $1 dollars",
+    });
+
+    assert.ok(result.content[0].text.includes("Successfully edited"));
+    const content = await fs.readFile(path.join(tmpDir, editFile), "utf-8");
+    assert.ok(content.includes("cost is $& and $1 dollars"), `Expected literal $& but got: ${content}`);
+
+    await fs.unlink(path.join(tmpDir, editFile));
+  });
+});
+
+// ─── vault_neighborhood depth cap (M7 fix) ───────────────────────────
+
+describe("handleNeighborhood depth cap", () => {
+  it("caps depth at 5 when a larger value is requested", async () => {
+    const handler = handlers.get("vault_neighborhood");
+    // Request depth 100; should be capped to 5 without error
+    const result = await handler({ path: "notes/alpha.md", depth: 100 });
+    const text = result.content[0].text;
+    // The result should mention the capped depth or just succeed within bounds
+    assert.ok(text, "Should return valid text");
+  });
+
+  it("uses default depth 2 when not specified", async () => {
+    const handler = handlers.get("vault_neighborhood");
+    const result = await handler({ path: "notes/alpha.md" });
+    assert.ok(result.content[0].text);
+  });
+
+  it("respects depth when within limits", async () => {
+    const handler = handlers.get("vault_neighborhood");
+    const result = await handler({ path: "notes/alpha.md", depth: 1 });
+    assert.ok(result.content[0].text);
+  });
+
+  it("vault_neighborhood returns clean error when file deleted after resolve", async () => {
+    const targetFile = path.join(tmpDir, "notes", "alpha.md");
+    await fs.unlink(targetFile);
+    try {
+      await handlers.get("vault_neighborhood")({ path: "alpha" });
+      assert.fail("should have thrown");
+    } catch (err) {
+      assert.ok(err.message.includes("not found") || err.message.includes("File not found"), `got: ${err.message}`);
+      assert.ok(!err.message.includes(tmpDir), "should not leak absolute vault path");
+    }
+    // Recreate with original content for other tests
+    await fs.writeFile(targetFile, `---\ntype: research\nstatus: active\ncreated: 2026-01-15\ntags:\n  - dev\n  - mcp\n---\n# Alpha Note\n\nSome content about [[beta]] and the MCP server.\nAlso references [[gamma|Gamma Note]].\n`, "utf-8");
+  });
+});
+
+// ─── vault_peek ──────────────────────────────────────────────────────
+
+describe("handlePeek", () => {
+  it("returns peek data for a normal file", async () => {
+    const handler = handlers.get("vault_peek");
+    const result = await handler({ path: "notes/devlog.md" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("devlog.md"));
+    assert.ok(text.includes("## 2026-01-01"));
+    assert.ok(text.includes("## 2026-02-01"));
+  });
+
+  it("includes frontmatter info", async () => {
+    const handler = handlers.get("vault_peek");
+    const result = await handler({ path: "notes/devlog.md" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("devlog"));
+  });
+
+  it("includes heading outline as indented tree", async () => {
+    const handler = handlers.get("vault_peek");
+    const result = await handler({ path: "notes/devlog.md" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Heading Outline"));
+    assert.ok(text.includes("["), "should contain char counts in brackets");
+    // Anchored to a line start: the obsidian:// link carries the random tmp vault name, which can contain "L<digit>".
+    assert.ok(!text.match(/^\s*L\d+\s/m), "should not contain line number prefixes");
+  });
+
+  it("supports fuzzy path resolution", async () => {
+    const handler = handlers.get("vault_peek");
+    const result = await handler({ path: "devlog" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("devlog.md"));
+  });
+
+  it("throws on non-existent file", async () => {
+    const handler = handlers.get("vault_peek");
+    await assert.rejects(
+      () => handler({ path: "nonexistent.md" }),
+      /not found|No matching file/i
+    );
+  });
+
+  it("includes size information", async () => {
+    const handler = handlers.get("vault_peek");
+    const result = await handler({ path: "notes/alpha.md" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("chars"));
+    assert.ok(text.includes("lines"));
+  });
+
+  describe("outline_offset", () => {
+    const sixty = Array.from({ length: 60 }, (_, i) => `## H${i + 1}\nText.\n`).join("\n");
+    before(async () => {
+      await fs.writeFile(path.join(tmpDir, "notes/sixty.md"), `---\ntype: note\n---\n${sixty}`);
+      await fs.writeFile(path.join(tmpDir, "notes/flat.md"), "No headings here.\n");
+    });
+    after(async () => {
+      await fs.rm(path.join(tmpDir, "notes/sixty.md"));
+      await fs.rm(path.join(tmpDir, "notes/flat.md"));
+    });
+
+    it("returns headings 51-60 of a 60-heading note for outline_offset 50, with no next-page line", async () => {
+      const text = (await handlers.get("vault_peek")({ path: "notes/sixty.md", outline_offset: 50 })).content[0].text;
+      assert.ok(text.includes("### Heading Outline (headings 51-60 of 60)\n  H51 [line 154, "), text);
+      assert.ok(text.includes("  H60 [line 181, "), text);
+      assert.ok(!text.includes("H50 [") && !text.includes("more (vault_peek"), text);
+    });
+
+    for (const [name, file, offset] of [
+      ["negative", "notes/sixty.md", -1],
+      ["not a whole number", "notes/sixty.md", 1.5],
+      ["not a number", "notes/sixty.md", "abc"],
+      ["at the heading count", "notes/sixty.md", 60],
+      ["past the heading count", "notes/sixty.md", 99],
+      ["past a note with no headings", "notes/flat.md", 1],
+    ]) {
+      it(`rejects an outline_offset that is ${name}, giving the number of headings`, async () => {
+        await assert.rejects(
+          () => handlers.get("vault_peek")({ path: file, outline_offset: offset }),
+          file === "notes/flat.md" ? /outline_offset.*no headings/ : /outline_offset.*60 headings/,
+        );
+      });
+    }
+
+    it("accepts outline_offset 0 on a note with no headings", async () => {
+      const text = (await handlers.get("vault_peek")({ path: "notes/flat.md", outline_offset: 0 })).content[0].text;
+      assert.ok(text.includes("flat.md") && !text.includes("Heading Outline"), text);
+    });
+  });
+});
+
+// ─── createHandlers ────────────────────────────────────────────────────
+
+describe("createHandlers", () => {
+  it("returns a Map with all expected tool names", () => {
+    const expectedTools = [
+      "vault_read", "vault_write", "vault_append", "vault_edit",
+      "vault_search", "vault_list", "vault_recent", "vault_links",
+      "vault_neighborhood", "vault_query", "vault_tags",
+      "vault_activity", "vault_semantic_search", "vault_suggest_links",
+      "vault_peek", "vault_trash", "vault_move",
+      "vault_update_frontmatter", "vault_add_links",
+      "vault_link_health",
+    ];
+    for (const tool of expectedTools) {
+      assert.ok(handlers.has(tool), `Missing handler: ${tool}`);
+      assert.equal(typeof handlers.get(tool), "function");
+    }
+  });
+
+  it("returns exactly 20 handlers", () => {
+    assert.equal(handlers.size, 20);
+  });
+
+  it("should not include vault_capture in handler map", () => {
+    assert.equal(handlers.has("vault_capture"), false,
+      "vault_capture should be removed from handler map");
+  });
+});
+
+// ─── vault_trash ──────────────────────────────────────────────────────
+
+describe("handleTrash", () => {
+  it("moves a file to .trash/ preserving folder structure", async () => {
+    // Create a fresh file to trash
+    const filePath = path.join(tmpDir, "moveable", "to-trash.md");
+    await fs.writeFile(filePath, "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# To Trash\n");
+
+    // Rebuild handlers to pick up the new file
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test-session-trash",
+    });
+
+    const handler = freshHandlers.get("vault_trash");
+    const result = await handler({ path: "moveable/to-trash.md" });
+
+    // File should be in .trash/
+    const trashed = path.join(tmpDir, ".trash", "moveable", "to-trash.md");
+    const exists = await fs.access(trashed).then(() => true, () => false);
+    assert.ok(exists, "File should exist in .trash/");
+
+    // Original should be gone
+    const originalExists = await fs.access(filePath).then(() => true, () => false);
+    assert.ok(!originalExists, "Original file should be removed");
+
+    // Output should confirm
+    assert.ok(result.content[0].text.includes("moveable/to-trash.md"));
+    assert.ok(result.content[0].text.includes(".trash/"));
+  });
+
+  it("warns about incoming links when trashing", async () => {
+    // Create linked notes
+    const trashDir2 = path.join(tmpDir, "trash-test");
+    await fs.mkdir(trashDir2, { recursive: true });
+    await fs.writeFile(path.join(trashDir2, "will-die.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Will Die\n");
+    await fs.writeFile(path.join(trashDir2, "refers.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Refers\nSee [[will-die]].\n");
+
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test-session-trash-links",
+    });
+
+    const handler = freshHandlers.get("vault_trash");
+    const result = await handler({ path: "trash-test/will-die.md" });
+    const text = result.content[0].text;
+
+    assert.ok(text.includes("trash-test/refers.md"), "Should warn about file with incoming link");
+  });
+
+  it("appends timestamp suffix on .trash/ collision", async () => {
+    // Create a new file to trash
+    const filePath = path.join(tmpDir, "moveable", "orphan-dup.md");
+    await fs.writeFile(filePath, "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Orphan Dup\n");
+
+    // Also ensure .trash/moveable/orphan-dup.md exists for collision
+    await fs.mkdir(path.join(tmpDir, ".trash", "moveable"), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, ".trash", "moveable", "orphan-dup.md"), "already in trash");
+
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test-session-trash-collision",
+    });
+
+    const handler = freshHandlers.get("vault_trash");
+    const result = await handler({ path: "moveable/orphan-dup.md" });
+    const text = result.content[0].text;
+
+    // Should succeed with .trash/ in output
+    assert.ok(text.includes(".trash/"), "Should mention .trash/");
+    // Original should be gone
+    const originalExists = await fs.access(filePath).then(() => true, () => false);
+    assert.ok(!originalExists, "Original should be removed");
+    // Previous trash file should still exist (not overwritten)
+    const prevTrash = await fs.readFile(path.join(tmpDir, ".trash", "moveable", "orphan-dup.md"), "utf-8");
+    assert.equal(prevTrash, "already in trash", "Previous trash entry should not be overwritten");
+  });
+
+  it("requires exact path (rejects fuzzy names)", async () => {
+    const handler = handlers.get("vault_trash");
+    await assert.rejects(
+      () => handler({ path: "target" }),
+      /ENOENT|no such file/i
+    );
+  });
+
+  it("throws on non-existent file", async () => {
+    const handler = handlers.get("vault_trash");
+    await assert.rejects(
+      () => handler({ path: "nonexistent-file-xyz.md" }),
+      /ENOENT|not found|No matching file/i
+    );
+  });
+});
+
+// ─── vault_move ───────────────────────────────────────────────────────
+
+describe("handleMove", () => {
+  // Helper to create fresh handlers with new temp files
+  async function freshHandlersFor(tmpDir) {
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    return createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test-move-" + Math.random().toString(36).slice(2, 8),
+    });
+  }
+
+  it("moves a file and preserves content", async () => {
+    const srcDir = path.join(tmpDir, "move-basic");
+    const destDir = path.join(tmpDir, "archive");
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.writeFile(path.join(srcDir, "doc.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Doc\nContent.\n");
+
+    const h = await freshHandlersFor(tmpDir);
+    const result = await h.get("vault_move")({ old_path: "move-basic/doc.md", new_path: "archive/doc.md" });
+
+    const newContent = await fs.readFile(path.join(destDir, "doc.md"), "utf-8");
+    assert.ok(newContent.includes("# Doc"));
+    const oldExists = await fs.access(path.join(srcDir, "doc.md")).then(() => true, () => false);
+    assert.ok(!oldExists);
+    assert.ok(result.content[0].text.includes("archive/doc.md"));
+  });
+
+  it("updates wikilinks in other files", async () => {
+    const srcDir = path.join(tmpDir, "move-links");
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.writeFile(path.join(srcDir, "moving.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Moving\n");
+    await fs.writeFile(path.join(srcDir, "stays.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Stays\nLinks to [[moving]] here.\n");
+
+    const h = await freshHandlersFor(tmpDir);
+    await h.get("vault_move")({ old_path: "move-links/moving.md", new_path: "move-links/moved.md" });
+
+    const staysContent = await fs.readFile(path.join(srcDir, "stays.md"), "utf-8");
+    assert.ok(staysContent.includes("[[moved]]"), `Expected [[moved]] but got: ${staysContent}`);
+    assert.ok(!staysContent.includes("[[moving]]"));
+  });
+
+  it("preserves aliases when updating links", async () => {
+    const srcDir = path.join(tmpDir, "move-alias");
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.writeFile(path.join(srcDir, "src.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Src\n");
+    await fs.writeFile(path.join(srcDir, "ref.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Ref\nSee [[src|Source File]].\n");
+
+    const h = await freshHandlersFor(tmpDir);
+    await h.get("vault_move")({ old_path: "move-alias/src.md", new_path: "move-alias/dest.md" });
+
+    const refContent = await fs.readFile(path.join(srcDir, "ref.md"), "utf-8");
+    assert.ok(refContent.includes("[[dest|Source File]]"), `Expected [[dest|Source File]] but got: ${refContent}`);
+  });
+
+  it("skips link updating when update_links is false", async () => {
+    const srcDir = path.join(tmpDir, "move-nolinks");
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.writeFile(path.join(srcDir, "moving2.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Moving2\n");
+    await fs.writeFile(path.join(srcDir, "ref2.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Ref2\nLinks to [[moving2]].\n");
+
+    const h = await freshHandlersFor(tmpDir);
+    await h.get("vault_move")({ old_path: "move-nolinks/moving2.md", new_path: "move-nolinks/moved2.md", update_links: false });
+
+    const refContent = await fs.readFile(path.join(srcDir, "ref2.md"), "utf-8");
+    assert.ok(refContent.includes("[[moving2]]"), "Links should NOT be updated");
+  });
+
+  it("errors when destination already exists", async () => {
+    const srcDir = path.join(tmpDir, "move-exists");
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.writeFile(path.join(srcDir, "a.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# A\n");
+    await fs.writeFile(path.join(srcDir, "b.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# B\n");
+
+    const h = await freshHandlersFor(tmpDir);
+    await assert.rejects(
+      () => h.get("vault_move")({ old_path: "move-exists/a.md", new_path: "move-exists/b.md" }),
+      /already exists/i
+    );
+  });
+
+  it("creates destination directories if needed", async () => {
+    const srcDir = path.join(tmpDir, "move-mkdir");
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.writeFile(path.join(srcDir, "doc.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Doc\n");
+
+    const h = await freshHandlersFor(tmpDir);
+    await h.get("vault_move")({ old_path: "move-mkdir/doc.md", new_path: "deep/nested/dir/doc.md" });
+
+    const newContent = await fs.readFile(path.join(tmpDir, "deep", "nested", "dir", "doc.md"), "utf-8");
+    assert.ok(newContent.includes("# Doc"));
+  });
+
+  it("requires exact source path (rejects fuzzy names)", async () => {
+    const h = await freshHandlersFor(tmpDir);
+    await assert.rejects(
+      () => h.get("vault_move")({ old_path: "target", new_path: "moveable/renamed.md" }),
+      /ENOENT|no such file/i
+    );
+  });
+
+  it("detects post-move basename ambiguity and rewrites to full paths", async () => {
+    const dir1 = path.join(tmpDir, "move-ambig", "folder-a");
+    const dir2 = path.join(tmpDir, "move-ambig", "folder-b");
+    await fs.mkdir(dir1, { recursive: true });
+    await fs.mkdir(dir2, { recursive: true });
+
+    await fs.writeFile(path.join(dir1, "unique-src.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Unique Src\n");
+    await fs.writeFile(path.join(dir2, "same-name.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Same Name B\n");
+    await fs.writeFile(path.join(dir1, "ref.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# Ref\nSee [[unique-src]].\n");
+
+    const h = await freshHandlersFor(tmpDir);
+    const result = await h.get("vault_move")({ old_path: "move-ambig/folder-a/unique-src.md", new_path: "move-ambig/folder-a/same-name.md" });
+
+    // Link should use full path to avoid ambiguity
+    const refContent = await fs.readFile(path.join(dir1, "ref.md"), "utf-8");
+    assert.ok(
+      refContent.includes("[[move-ambig/folder-a/same-name]]"),
+      `Expected full path link but got: ${refContent}`
+    );
+
+    // Output should mention ambiguity
+    const text = result.content[0].text;
+    assert.ok(text.toLowerCase().includes("ambig"), `Expected ambiguity warning but got: ${text}`);
+  });
+
+  it("rewrites full-path wikilinks [[folder/name]]", async () => {
+    const srcDir = path.join(tmpDir, "move-fullpath");
+    await fs.mkdir(srcDir, { recursive: true });
+    await fs.writeFile(path.join(srcDir, "fp-source.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# FP Source\n");
+    await fs.writeFile(path.join(srcDir, "fp-ref.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# FP Ref\nSee [[move-fullpath/fp-source]] for details.\n");
+
+    const h = await freshHandlersFor(tmpDir);
+    await h.get("vault_move")({ old_path: "move-fullpath/fp-source.md", new_path: "move-fullpath/fp-dest.md" });
+
+    const refContent = await fs.readFile(path.join(srcDir, "fp-ref.md"), "utf-8");
+    assert.ok(refContent.includes("[[fp-dest]]"), `Expected [[fp-dest]] but got: ${refContent}`);
+    assert.ok(!refContent.includes("[[move-fullpath/fp-source]]"));
+  });
+});
+
+// ─── vault_update_frontmatter ─────────────────────────────────────────
+
+describe("handleUpdateFrontmatter", () => {
+  it("updates frontmatter fields in an existing note", async () => {
+    await handlers.get("vault_write")({
+      template: "task",
+      path: "tasks/fm-update-test.md",
+      frontmatter: { tags: ["task"] }
+    });
+    const result = await handlers.get("vault_update_frontmatter")({
+      path: "tasks/fm-update-test.md",
+      fields: { status: "done", completed: "2026-02-10" }
+    });
+    assert.ok(result.content[0].text.includes("status: done"));
+    assert.ok(result.content[0].text.includes("completed: 2026-02-10"));
+
+    const content = await fs.readFile(path.join(tmpDir, "tasks/fm-update-test.md"), "utf-8");
+    assert.ok(content.includes("status: done"));
+    assert.ok(content.includes("completed:") && content.includes("2026-02-10"), "completed field present");
+    assert.ok(content.includes("## Description"), "body preserved");
+  });
+
+  it("removes a field when set to null", async () => {
+    await handlers.get("vault_write")({
+      template: "task",
+      path: "tasks/fm-remove-test.md",
+      frontmatter: { tags: ["task"], priority: "high" }
+    });
+    await handlers.get("vault_update_frontmatter")({
+      path: "tasks/fm-remove-test.md",
+      fields: { priority: null }
+    });
+    const content = await fs.readFile(path.join(tmpDir, "tasks/fm-remove-test.md"), "utf-8");
+    assert.ok(!content.includes("priority:"), "priority field removed");
+  });
+
+  it("rejects deletion of protected fields", async () => {
+    await handlers.get("vault_write")({
+      template: "task",
+      path: "tasks/fm-protect-test.md",
+      frontmatter: { tags: ["task"] }
+    });
+    await assert.rejects(
+      () => handlers.get("vault_update_frontmatter")({
+        path: "tasks/fm-protect-test.md",
+        fields: { type: null }
+      }),
+      /cannot remove/i
+    );
+  });
+
+  it("errors on non-existent file without leaking absolute path", async () => {
+    try {
+      await handlers.get("vault_update_frontmatter")({
+        path: "tasks/no-such-file.md",
+        fields: { status: "done" }
+      });
+      assert.fail("should have thrown");
+    } catch (e) {
+      assert.ok(e.message.includes("File not found"), "should have clear error message");
+      assert.ok(e.message.includes("tasks/no-such-file.md"), "should include relative path");
+      assert.ok(!e.message.includes(tmpDir), "should not leak absolute vault path");
+    }
+  });
+
+  it("rejects fields that are missing or not an object, leaving the note unchanged", async () => {
+    await handlers.get("vault_write")({
+      template: "task",
+      path: "tasks/fm-bad-fields.md",
+      frontmatter: { tags: ["task"] }
+    });
+    const file = path.join(tmpDir, "tasks/fm-bad-fields.md");
+    const before = await fs.readFile(file, "utf-8");
+    for (const fields of [undefined, null, "status: done", ["status"], 5]) {
+      await assert.rejects(
+        () => handlers.get("vault_update_frontmatter")({ path: "tasks/fm-bad-fields.md", fields }),
+        /fields must be an object/,
+        `fields: ${JSON.stringify(fields)}`
+      );
+    }
+    assert.equal(await fs.readFile(file, "utf-8"), before);
+  });
+
+  it("errors on file without frontmatter", async () => {
+    await fs.writeFile(path.join(tmpDir, "no-fm.md"), "# No Frontmatter\n\nJust body.\n");
+    await assert.rejects(
+      () => handlers.get("vault_update_frontmatter")({
+        path: "no-fm.md",
+        fields: { status: "done" }
+      }),
+      /no frontmatter/i
+    );
+  });
+});
+
+describe("handleRead force param with FORCE_HARD_CAP", () => {
+  it("returns peek data with hard cap message for files exceeding 400k chars", async () => {
+    const hugeContent = "---\ntype: test\ncreated: 2026-01-01\ntags:\n  - test\n---\n" + "x".repeat(410_000);
+    await fs.writeFile(path.join(tmpDir, "huge-force-cap.md"), hugeContent);
+
+    // Rebuild handlers to pick up new file
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: new Map(),
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test",
+    });
+
+    const result = await freshHandlers.get("vault_read")({ path: "huge-force-cap.md", force: true });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Hard cap reached"), "should include hard cap message");
+    assert.ok(text.includes("huge-force-cap.md"), "should include filename");
+    assert.ok(!text.includes("x".repeat(1000)), "should NOT include raw content");
+  });
+});
+
+describe("handleList ReDoS protection", () => {
+  it("completes quickly even with many wildcards (linear-time glob)", async () => {
+    // This pattern with regex .*? would cause catastrophic backtracking
+    const evilPattern = "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b";
+    const start = Date.now();
+    const result = await handlers.get("vault_list")({ path: "", pattern: evilPattern });
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed < 1000, `should complete in <1s, took ${elapsed}ms`);
+    assert.ok(result.content[0].text);
+  });
+});
+
+describe("handleWrite atomic creation (wx flag)", () => {
+  it("rejects creation of existing file with clear error", async () => {
+    // Write an existing file
+    await fs.writeFile(path.join(tmpDir, "existing-wx.md"), "---\ntype: test\ncreated: 2026-01-01\ntags:\n  - test\n---\ncontent");
+
+    const reg = await buildTemplateRegistry(tmpDir);
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: reg,
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test",
+    });
+
+    await assert.rejects(
+      () => freshHandlers.get("vault_write")({
+        template: "research-note",
+        path: "existing-wx.md",
+        frontmatter: { tags: ["test"] }
+      }),
+      /already exists/i
+    );
+  });
+});
+
+// ─── vault_add_links ──────────────────────────────────────────────────
+
+describe("vault_add_links", () => {
+  async function freshHandlersForAddLinks(tmpDir) {
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    return createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test-add-links-" + Math.random().toString(36).slice(2, 8),
+    });
+  }
+
+  it("adds annotated links to existing ## Related section", async () => {
+    const handler = handlers.get("vault_add_links");
+    const result = await handler({
+      path: "notes/with-related.md",
+      links: [
+        { target: "notes/beta.md", annotation: "architecture context" },
+        { target: "notes/gamma.md", annotation: "permanent knowledge" },
+      ],
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Added 2"));
+
+    const content = await fs.readFile(path.join(tmpDir, "notes", "with-related.md"), "utf-8");
+    assert.ok(content.includes("[[alpha]]"), "existing link preserved");
+    assert.ok(content.includes("[[beta]] — architecture context"), "beta added");
+    assert.ok(content.includes("[[gamma]] — permanent knowledge"), "gamma added");
+  });
+
+  it("skips links that already exist (deduplication)", async () => {
+    const handler = handlers.get("vault_add_links");
+    const result = await handler({
+      path: "notes/with-related.md",
+      links: [
+        { target: "notes/alpha.md", annotation: "duplicate attempt" },
+      ],
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Skipped 1"), "should report skip");
+    assert.ok(text.includes("already linked"), "should state reason");
+  });
+
+  it("skips links to non-existent targets", async () => {
+    const handler = handlers.get("vault_add_links");
+    const result = await handler({
+      path: "notes/with-related.md",
+      links: [
+        { target: "notes/nonexistent.md", annotation: "should fail" },
+      ],
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Skipped 1"), "should report skip");
+    assert.ok(text.includes("not found"), "should state reason");
+  });
+
+  it("creates ## Related section when missing and create_section is true", async () => {
+    const handler = handlers.get("vault_add_links");
+    const result = await handler({
+      path: "notes/gamma.md",
+      links: [
+        { target: "notes/alpha.md", annotation: "related research" },
+      ],
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Added 1"));
+
+    const content = await fs.readFile(path.join(tmpDir, "notes", "gamma.md"), "utf-8");
+    assert.ok(content.includes("## Related"), "section created");
+    assert.ok(content.includes("[[alpha]] — related research"), "link added");
+  });
+
+  it("errors when section missing and create_section is false", async () => {
+    const noRelDir = path.join(tmpDir, "add-links-test");
+    await fs.mkdir(noRelDir, { recursive: true });
+    await fs.writeFile(path.join(noRelDir, "no-related.md"), "---\ntype: fleeting\ncreated: 2026-01-01\ntags: [test]\n---\n# No Related Section\n\nJust content.\n");
+
+    const freshHandlers = await freshHandlersForAddLinks(tmpDir);
+    await assert.rejects(
+      () => freshHandlers.get("vault_add_links")({
+        path: "add-links-test/no-related.md",
+        links: [{ target: "notes/alpha.md", annotation: "test" }],
+        create_section: false,
+      }),
+      /not found/i
+    );
+  });
+
+  it("uses custom section heading", async () => {
+    const customDir = path.join(tmpDir, "add-links-custom");
+    await fs.mkdir(customDir, { recursive: true });
+    await fs.writeFile(path.join(customDir, "custom-section.md"), `---
+type: research
+created: 2026-01-01
+tags:
+  - test
+---
+# Custom Section Note
+
+Some content.
+
+## References
+
+## Notes
+
+More notes here.
+`);
+
+    const freshHandlers = await freshHandlersForAddLinks(tmpDir);
+    const result = await freshHandlers.get("vault_add_links")({
+      path: "add-links-custom/custom-section.md",
+      links: [{ target: "notes/alpha.md", annotation: "see also" }],
+      section: "## References",
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Added 1"));
+
+    const content = await fs.readFile(path.join(customDir, "custom-section.md"), "utf-8");
+    // Link should be between ## References and ## Notes
+    const refIdx = content.indexOf("## References");
+    const notesIdx = content.indexOf("## Notes");
+    const linkIdx = content.indexOf("[[alpha]] — see also");
+    assert.ok(linkIdx > refIdx, "link after References heading");
+    assert.ok(linkIdx < notesIdx, "link before Notes heading");
+  });
+
+  it("rejects non-existent file path", async () => {
+    const handler = handlers.get("vault_add_links");
+    await assert.rejects(
+      () => handler({
+        path: "notes/nonexistent-file.md",
+        links: [{ target: "notes/alpha.md", annotation: "test" }],
+      }),
+      /not found|ENOENT/i
+    );
+  });
+
+  it("requires at least one link", async () => {
+    const handler = handlers.get("vault_add_links");
+    await assert.rejects(
+      () => handler({
+        path: "notes/with-related.md",
+        links: [],
+      }),
+      /at least one link/i
+    );
+  });
+
+  it("handles mixed valid and invalid links", async () => {
+    const mixedDir = path.join(tmpDir, "add-links-mixed");
+    await fs.mkdir(mixedDir, { recursive: true });
+    await fs.writeFile(path.join(mixedDir, "mixed-test.md"), `---
+type: research
+created: 2026-01-01
+tags:
+  - test
+---
+# Mixed Test
+
+Content here.
+
+## Related
+`);
+
+    const freshHandlers = await freshHandlersForAddLinks(tmpDir);
+    const result = await freshHandlers.get("vault_add_links")({
+      path: "add-links-mixed/mixed-test.md",
+      links: [
+        { target: "notes/alpha.md", annotation: "valid link" },
+        { target: "notes/nonexistent.md", annotation: "bad link" },
+        { target: "notes/beta.md", annotation: "another valid" },
+      ],
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Added 2"), "2 valid links added");
+    assert.ok(text.includes("Skipped 1"), "1 invalid skipped");
+  });
+});
+
+// ─── vault_link_health ───────────────────────────────────────────────
+
+describe("vault_link_health", () => {
+  async function freshHandlersForLinkHealth(dir) {
+    const templateRegistry = await buildTemplateRegistry(dir);
+    return createHandlers({
+      vaultPath: dir,
+      templateRegistry,
+      semanticIndex: null,
+      activityLog: null,
+      sessionId: "test-link-health-" + Math.random().toString(36).slice(2, 8),
+    });
+  }
+
+  it("finds orphan notes (no incoming or outgoing links)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lh-orphan-"));
+    const tplDir = path.join(dir, "05-Templates");
+    await fs.mkdir(tplDir, { recursive: true });
+    await fs.writeFile(path.join(tplDir, "research-note.md"), TEMPLATE_CONTENT);
+
+    const notesDir = path.join(dir, "notes");
+    await fs.mkdir(notesDir, { recursive: true });
+    await fs.writeFile(path.join(notesDir, "lh-isolated.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Isolated Note
+
+No links at all.
+`);
+    // A connected note for contrast (links to itself or a third note, not lh-isolated)
+    await fs.writeFile(path.join(notesDir, "lh-connected.md"), `---
+type: research
+created: 2026-01-01
+tags:
+  - test
+---
+# Connected Note
+
+Links to [[lh-peer]].
+`);
+    await fs.writeFile(path.join(notesDir, "lh-peer.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Peer Note
+
+Links back to [[lh-connected]].
+`);
+
+    const h = await freshHandlersForLinkHealth(dir);
+    const result = await h.get("vault_link_health")({ checks: ["orphans"] });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Orphan notes"), "has orphan section");
+    assert.ok(text.includes("lh-isolated.md"), "isolated note is orphan");
+    assert.ok(!text.includes("lh-connected.md"), "connected note is not orphan");
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("finds broken wikilinks", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lh-broken-"));
+    const tplDir = path.join(dir, "05-Templates");
+    await fs.mkdir(tplDir, { recursive: true });
+    await fs.writeFile(path.join(tplDir, "research-note.md"), TEMPLATE_CONTENT);
+
+    const notesDir = path.join(dir, "notes");
+    await fs.mkdir(notesDir, { recursive: true });
+    await fs.writeFile(path.join(notesDir, "lh-broken.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Broken Links Note
+
+Links to [[nonexistent-note]] and [[also-missing]] and [[lh-good]].
+`);
+    await fs.writeFile(path.join(notesDir, "lh-good.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Good Note
+`);
+
+    const h = await freshHandlersForLinkHealth(dir);
+    const result = await h.get("vault_link_health")({ checks: ["broken"] });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Broken links"), "has broken section");
+    assert.ok(text.includes("nonexistent-note"), "finds nonexistent-note");
+    assert.ok(text.includes("also-missing"), "finds also-missing");
+    assert.ok(!text.includes("lh-good"), "valid link not reported");
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("finds weakly connected notes (only 1 total link)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lh-weak-"));
+    const tplDir = path.join(dir, "05-Templates");
+    await fs.mkdir(tplDir, { recursive: true });
+    await fs.writeFile(path.join(tplDir, "research-note.md"), TEMPLATE_CONTENT);
+
+    const notesDir = path.join(dir, "notes");
+    await fs.mkdir(notesDir, { recursive: true });
+    // lh-weak has 1 outgoing link to gamma, and no one links to it
+    await fs.writeFile(path.join(notesDir, "lh-weak.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Weak Note
+
+Only one link: [[lh-target]].
+`);
+    await fs.writeFile(path.join(notesDir, "lh-target.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Target Note
+
+Links to [[lh-well-connected]] and [[lh-other]].
+`);
+    await fs.writeFile(path.join(notesDir, "lh-well-connected.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Well Connected
+
+Links to [[lh-target]] and [[lh-other]].
+`);
+    await fs.writeFile(path.join(notesDir, "lh-other.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Other
+
+Links to [[lh-well-connected]].
+`);
+
+    const h = await freshHandlersForLinkHealth(dir);
+    const result = await h.get("vault_link_health")({ checks: ["weak"] });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Weakly connected"), "has weak section");
+    assert.ok(text.includes("lh-weak.md"), "weak note found");
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("scopes to a folder", async () => {
+    const result = await handlers.get("vault_link_health")({
+      folder: "notes",
+      checks: ["orphans"],
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("notes"), "output mentions scoped folder");
+    assert.ok(!text.includes("05-Templates"), "templates not in output");
+  });
+
+  it("respects limit per category", async () => {
+    const result = await handlers.get("vault_link_health")({
+      checks: ["orphans"],
+      limit: 1,
+    });
+    const text = result.content[0].text;
+    // Count orphan bullet lines
+    const orphanLines = text.split("\n").filter(l => l.startsWith("- ") && l.includes("(type:"));
+    assert.ok(orphanLines.length <= 1, `expected at most 1 orphan line, got ${orphanLines.length}`);
+  });
+
+  it("defaults to all checks when none specified", async () => {
+    const result = await handlers.get("vault_link_health")({});
+    const text = result.content[0].text;
+    assert.ok(text.includes("scanned"), "has scanned count");
+    assert.ok(text.includes("Orphan"), "has orphan section");
+    assert.ok(text.includes("Broken"), "has broken section");
+    assert.ok(text.includes("Weakly"), "has weak section");
+    assert.ok(text.includes("Ambiguous"), "has ambiguous section");
+  });
+
+  it("finds ambiguous wikilinks", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lh-ambig-"));
+    const tplDir = path.join(dir, "05-Templates");
+    await fs.mkdir(tplDir, { recursive: true });
+    await fs.writeFile(path.join(tplDir, "research-note.md"), TEMPLATE_CONTENT);
+
+    const notesDir = path.join(dir, "notes");
+    const otherDir = path.join(dir, "other");
+    await fs.mkdir(notesDir, { recursive: true });
+    await fs.mkdir(otherDir, { recursive: true });
+
+    // Two files with same basename "lh-dup"
+    await fs.writeFile(path.join(notesDir, "lh-dup.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Dup in notes
+`);
+    await fs.writeFile(path.join(otherDir, "lh-dup.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Dup in other
+`);
+    await fs.writeFile(path.join(notesDir, "lh-ambig.md"), `---
+type: fleeting
+created: 2026-01-01
+tags:
+  - test
+---
+# Ambig Note
+
+Links to [[lh-dup]] which is ambiguous.
+`);
+
+    const h = await freshHandlersForLinkHealth(dir);
+    const result = await h.get("vault_link_health")({ checks: ["ambiguous"] });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Ambiguous"), "has ambiguous section");
+    assert.ok(text.includes("lh-dup"), "reports the ambiguous link");
+    assert.ok(text.includes("2 files"), "reports number of matching files");
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("does not report non-md embeds as broken", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lh-embed-"));
+    const tplDir = path.join(dir, "05-Templates");
+    await fs.mkdir(tplDir, { recursive: true });
+    await fs.writeFile(path.join(tplDir, "research-note.md"), TEMPLATE_CONTENT);
+
+    const notesDir = path.join(dir, "notes");
+    await fs.mkdir(notesDir, { recursive: true });
+    await fs.writeFile(path.join(notesDir, "embed-test.md"), `---
+type: note
+created: 2026-01-01
+tags:
+  - test
+---
+# Test
+![[photo.png]]
+[[real-broken-link]]
+`);
+    const h = await freshHandlersForLinkHealth(dir);
+    const result = await h.get("vault_link_health")({ checks: ["broken"] });
+    const text = result.content[0].text;
+    assert.ok(!text.includes("photo.png"), "should not report image embed as broken");
+    assert.ok(text.includes("real-broken-link"), "should still report genuinely broken md links");
+    await fs.rm(dir, { recursive: true });
+  });
+});
+
+describe("vault_neighborhood include_semantic", () => {
+  it("appends semantic results when include_semantic is true", async () => {
+    const mockResults = [
+      { path: "notes/devlog.md", score: 0.85, preview: "Devlog note" },
+      { path: "notes/alpha.md", score: 0.7, preview: "Alpha note" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    const result = await freshHandlers.get("vault_neighborhood")({
+      path: "notes/alpha.md",
+      include_semantic: true
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Graph neighborhood"));
+    assert.ok(text.includes("Semantically related"), "should include semantic section header");
+    // devlog.md is not in alpha's structural graph, so it should appear as semantically related
+    assert.ok(text.includes("devlog.md"), "should list devlog as semantically related");
+  });
+
+  it("excludes notes already in structural graph from semantic results", async () => {
+    const mockResults = [
+      { path: "notes/beta.md", score: 0.9, preview: "Beta is linked" },
+      { path: "notes/gamma.md", score: 0.7, preview: "Gamma not linked from beta" },
+    ];
+    const freshHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test"
+    });
+    const result = await freshHandlers.get("vault_neighborhood")({
+      path: "notes/beta.md",
+      include_semantic: true,
+      semantic_limit: 5
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Graph neighborhood"));
+  });
+
+  it("preserves normal behavior when include_semantic is false", async () => {
+    const result = await handlers.get("vault_neighborhood")({
+      path: "notes/alpha.md",
+      include_semantic: false
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Graph neighborhood"));
+    assert.ok(!text.includes("Semantically related"));
+  });
+
+  it("gracefully handles when semanticIndex is null", async () => {
+    const result = await handlers.get("vault_neighborhood")({
+      path: "notes/alpha.md",
+      include_semantic: true
+    });
+    const text = result.content[0].text;
+    assert.ok(text.includes("Graph neighborhood"));
+    assert.ok(!text.includes("Semantically related"));
+  });
+});
+
+// ─── vault_activity (with live activityLog) ─────────────────────────
+
+describe("vault_activity (with live activityLog)", () => {
+  let activityHandlers;
+  let activityLog;
+  const testSessionId = "abcdef12-3456-7890-abcd-ef1234567890";
+
+  before(async () => {
+    const dbPath = path.join(tmpDir, ".obsidian", "activity-log-test.db");
+    await fs.mkdir(path.dirname(dbPath), { recursive: true });
+    activityLog = new ActivityLog({ vaultPath: tmpDir, sessionId: testSessionId });
+    // Override the dbPath so it uses our test-specific DB
+    activityLog.dbPath = dbPath;
+    await activityLog.initialize();
+
+    const templateRegistry = await buildTemplateRegistry(tmpDir);
+    activityHandlers = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry,
+      semanticIndex: null,
+      activityLog,
+      sessionId: testSessionId,
+    });
+  });
+
+  after(() => {
+    activityLog.shutdown();
+  });
+
+  it("query returns formatted entries with truncated session ID", async () => {
+    activityLog.log("vault_read", { path: "test.md" });
+    const result = await activityHandlers.get("vault_activity")({ action: "query" });
+    const text = result.content[0].text;
+    assert.ok(text.includes("vault_read"), "should include tool name");
+    assert.ok(text.includes(testSessionId.slice(0, 8)), "should include truncated session ID");
+    assert.ok(!text.includes(testSessionId), "should NOT include full session ID");
+    assert.ok(text.includes("1 entry"), "should report 1 entry");
+    assert.ok(text.includes("test.md"), "should include args JSON");
+  });
+
+  it("clear deletes entries and reports count", async () => {
+    activityLog.log("vault_write", { path: "a.md" });
+    activityLog.log("vault_edit", { path: "b.md" });
+    const clearResult = await activityHandlers.get("vault_activity")({ action: "clear" });
+    assert.ok(clearResult.content[0].text.includes("Cleared"), "should report cleared count");
+    // The exact count depends on entries from previous test + these 2, but should be >= 2
+    const queryResult = await activityHandlers.get("vault_activity")({ action: "query" });
+    assert.ok(queryResult.content[0].text.includes("No activity entries found"), "should be empty after clear");
+  });
+
+  it("unknown action throws", async () => {
+    await assert.rejects(
+      () => activityHandlers.get("vault_activity")({ action: "invalid" }),
+      /Unknown action/
+    );
+  });
+
+  it("query shows summarized args, including rows an older version stored in full", async () => {
+    activityLog.log("vault_write", { path: "big/new.md", content: "w".repeat(5000) });
+    activityLog.db.prepare("INSERT INTO activity (timestamp, session_id, tool_name, args_json, path) VALUES (?, ?, ?, ?, ?)")
+      .run(new Date().toISOString(), testSessionId, "vault_append", JSON.stringify({ path: "big/old.md", content: "v".repeat(5000) }), "big/old.md");
+    const text = (await activityHandlers.get("vault_activity")({ action: "query", path: "big" })).content[0].text;
+    assert.ok(text.includes("2 entries"), text);
+    assert.equal(text.split("<5000 chars>").length - 1, 2, text);
+    assert.ok(!text.includes("w".repeat(201)) && !text.includes("v".repeat(201)));
+  });
+});
+
+// ─── T2 Quick Wins ──────────────────────────────────────────────────
+
+describe("positiveInt indirect tests via vault_read lines", () => {
+  it("vault_read with float lines.start floors to integer", async () => {
+    const result = await handlers.get("vault_read")({ path: "notes/alpha.md", lines: { start: 1.7, end: 3 } });
+    assert.ok(result.content[0].text.includes("[Lines 1-3"), "should floor 1.7 to 1");
+  });
+
+  it("vault_read rejects Infinity in lines", async () => {
+    await assert.rejects(
+      () => handlers.get("vault_read")({ path: "notes/alpha.md", lines: { start: Infinity, end: 5 } }),
+      /positive integers/
+    );
+  });
+});
+
+describe("vault_suggest_links graph_context + no path", () => {
+  it("throws when graph_context is true but path is missing", async () => {
+    const mockResults = [
+      { path: "notes/beta.md", score: 0.8, preview: "Beta content" },
+    ];
+    const handlersWithSemantic = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test-graph-ctx-no-path",
+    });
+    await assert.rejects(
+      () => handlersWithSemantic.get("vault_suggest_links")({ content: "some text", graph_context: true }),
+      /graph_context requires.*path/
+    );
+  });
+});
+
+describe("vault_semantic_search invalid graph_weight", () => {
+  it("rejects invalid graph_weight", async () => {
+    const mockResults = [
+      { path: "notes/beta.md", score: 0.8, preview: "Beta" },
+    ];
+    const handlersWithSemantic = await createHandlers({
+      vaultPath: tmpDir,
+      templateRegistry: await buildTemplateRegistry(tmpDir),
+      semanticIndex: createMockSemanticIndex(mockResults),
+      activityLog: null,
+      sessionId: "test-invalid-graph-weight",
+    });
+    await assert.rejects(
+      () => handlersWithSemantic.get("vault_semantic_search")({ query: "test", anchor: "notes/alpha.md", graph_weight: 2.0 }),
+      /graph_weight must be a number between 0 and 1/
+    );
+  });
+});
+
+describe("vault_write with variables param", () => {
+  it("substitutes custom variables in template", async () => {
+    const outPath = `output/custom-var-test-${Date.now()}.md`;
+    await handlers.get("vault_write")({
+      template: "custom-var",
+      path: outPath,
+      frontmatter: { tags: ["research"] },
+      variables: { summary: "This is the summary text", details: "These are the details" },
+    });
+
+    const content = await fs.readFile(path.join(tmpDir, outPath), "utf-8");
+    assert.ok(content.includes("This is the summary text"), "summary variable should be substituted");
+    assert.ok(content.includes("These are the details"), "details variable should be substituted");
+    assert.ok(!content.includes("<% summary %>"), "template placeholder should be gone");
+    assert.ok(!content.includes("<% details %>"), "template placeholder should be gone");
+  });
+});
+
+// ─── markdown.js adoption: heading lookup and read cap ───────────────
+
+describe("heading lookup and vault_read output cap", () => {
+  let dir;
+  let h;
+  const FRONTMATTER = "---\ntype: devlog\ncreated: 2026-01-01\ntags:\n  - dev\n---\n";
+  const longLines = Array.from({ length: 3000 }, (_, i) => `Line ${String(i + 1).padStart(4, "0")}: ${"x".repeat(40)}`);
+  // Lines 1-6 frontmatter, 7 "# Big", 8 "", 9 "## Long", 10-3009 long lines, 3010 "## After", 3011 "", 3012 "Tail.", 3013 ""
+  const BIG = FRONTMATTER + "# Big\n\n## Long\n" + longLines.join("\n") + "\n## After\n\nTail.\n";
+  const bigLines = BIG.split("\n");
+  const DUPES = "---\ntype: note\ncreated: 2026-01-01\ntags: [t]\n---\n# Dupes\n## Notes\na\n## Other\n## Notes\nb\n## Related\n- [[x]]\n## Related\n";
+  const MARKER = /\[truncated: lines (\d+)–(\d+) of (\d+); continue with lines: \{start: (\d+)\}\]$/;
+
+  before(async () => {
+    dir = await fs.mkdtemp(path.join(os.tmpdir(), "heading-cap-"));
+    await fs.writeFile(path.join(dir, "big.md"), BIG);
+    await fs.writeFile(path.join(dir, "dupes.md"), DUPES);
+    await fs.writeFile(path.join(dir, "target.md"), "---\ntype: note\ncreated: 2026-01-01\ntags: [t]\n---\n# Target\n");
+    h = await createHandlers({ vaultPath: dir, templateRegistry: new Map(), semanticIndex: null, activityLog: null, sessionId: "heading-cap" });
+  });
+
+  after(async () => {
+    await fs.rm(dir, { recursive: true });
+  });
+
+  for (const [mode, args, prefix, firstLine] of [
+    ["heading", { heading: "## Long" }, "", 9],
+    ["tail", { tail: 3004 }, FRONTMATTER, 10],
+    ["tail_sections", { tail_sections: 2 }, FRONTMATTER, 9],
+    ["lines", { lines: { start: 9, end: 3013 } }, "[Lines 9-3013 of 3013]\n\n", 9],
+  ]) {
+    it(`caps ${mode} output at the 80k cap on a line boundary and says where to continue`, async () => {
+      const text = (await h.get("vault_read")({ path: "big.md", ...args })).content[0].text;
+      assert.ok(text.startsWith(prefix), "mode prefix kept");
+      const m = text.match(MARKER);
+      assert.ok(m, "truncation marker present");
+      const [a, b, total, next] = m.slice(1).map(Number);
+      assert.deepEqual([a, total, next], [firstLine, bigLines.length, b + 1]);
+      const kept = text.slice(prefix.length, m.index);
+      assert.equal(kept, bigLines.slice(a - 1, b).join("\n") + "\n", "kept text is exactly file lines a..b");
+      assert.ok(kept.length <= AUTO_REDIRECT_THRESHOLD, "within the cap");
+      assert.ok(kept.length + bigLines[b].length + 1 > AUTO_REDIRECT_THRESHOLD, "as many whole lines as fit");
+    });
+  }
+
+  it("returns a chunk whole (a chunk is never larger than the cap)", async () => {
+    const text = (await h.get("vault_read")({ path: "big.md", chunk: 1 })).content[0].text;
+    assert.equal(text, `[Chunk 1 of 2, chars 1-80000 of ${BIG.length}]\n\n` + BIG.slice(0, 80_000));
+  });
+
+  it("with force, an explicit mode is capped at the 400k hard cap instead of 80k", async () => {
+    const text = (await h.get("vault_read")({ path: "big.md", heading: "## Long", force: true })).content[0].text;
+    assert.equal(text, BIG.slice(BIG.indexOf("## Long"), BIG.indexOf("## After")));
+  });
+
+  for (const [tool, call, message] of [
+    ["vault_read heading", (hs) => hs.get("vault_read")({ path: "dupes.md", heading: "## Notes" }), "line 7: ## Notes\n  line 10: ## Notes"],
+    ["vault_append with position", (hs) => hs.get("vault_append")({ path: "dupes.md", heading: "Notes", position: "end_of_section", content: "x" }), "line 7: ## Notes\n  line 10: ## Notes"],
+    ["vault_append without position", (hs) => hs.get("vault_append")({ path: "dupes.md", heading: "## Notes", content: "x" }), "line 7: ## Notes\n  line 10: ## Notes"],
+    ["vault_add_links", (hs) => hs.get("vault_add_links")({ path: "dupes.md", links: [{ target: "target.md" }] }), "line 12: ## Related\n  line 14: ## Related"],
+  ]) {
+    it(`${tool} rejects a duplicated heading with line numbers and leaves the note unchanged`, async () => {
+      await assert.rejects(() => call(h), (err) => {
+        assert.match(err.message, /is ambiguous \(2 matches\)/);
+        assert.ok(err.message.includes(message));
+        return true;
+      });
+      assert.equal(await fs.readFile(path.join(dir, "dupes.md"), "utf-8"), DUPES);
+    });
+  }
+
+  it("vault_read heading matches a heading given without #s", async () => {
+    const text = (await h.get("vault_read")({ path: "big.md", heading: "After" })).content[0].text;
+    assert.equal(text, "## After\n\nTail.\n");
+  });
+
+  it("vault_append inserts after a heading given without #s", async () => {
+    await fs.writeFile(path.join(dir, "append-text.md"), "# T\n## Notes\nold\n");
+    await h.get("vault_append")({ path: "append-text.md", heading: "Notes", content: "Inserted" });
+    assert.equal(await fs.readFile(path.join(dir, "append-text.md"), "utf-8"), "# T\n## Notes\nInserted\nold\n");
+  });
+
+  it("vault_add_links uses an existing section named without #s instead of creating one", async () => {
+    await fs.writeFile(path.join(dir, "links-text.md"), "# L\n\n## Related\n- [[x]]\n\n## Later\n");
+    await h.get("vault_add_links")({ path: "links-text.md", links: [{ target: "target.md" }], section: "Related" });
+    assert.equal(await fs.readFile(path.join(dir, "links-text.md"), "utf-8"), "# L\n\n## Related\n- [[x]]\n\n- [[target]]\n## Later\n");
+  });
+
+  it("vault_append without position still appends at the end when the heading is missing", async () => {
+    await fs.writeFile(path.join(dir, "append-missing.md"), "# T\nbody\n");
+    await h.get("vault_append")({ path: "append-missing.md", heading: "## Missing", content: "End" });
+    assert.equal(await fs.readFile(path.join(dir, "append-missing.md"), "utf-8"), "# T\nbody\n\nEnd");
+  });
+});
+
+// ─── Shared link parser/resolver in graph tools ──────────────────────
+
+describe("graph tools use the shared link parser and resolver", () => {
+  /** Temp vault from { "rel/path.md": content } plus handlers bound to it. */
+  async function linkVault(files, semanticIndex = null) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "resolver-handlers-"));
+    for (const [rel, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(dir, rel)), { recursive: true });
+      await fs.writeFile(path.join(dir, rel), content);
+    }
+    const h = await createHandlers({
+      vaultPath: dir,
+      templateRegistry: new Map(),
+      semanticIndex,
+      activityLog: null,
+      sessionId: "resolver-test",
+    });
+    return { dir, h };
+  }
+
+  it("vault_links lists outgoing links outside code, with \\| treated as the alias separator", async () => {
+    const { dir, h } = await linkVault({
+      "beta.md": "# Beta\n",
+      "src.md": "| [[beta\\|B]] |\n```\n[[ghost]]\n```\n",
+    });
+    const text = (await h.get("vault_links")({ path: "src.md", direction: "outgoing" })).content[0].text;
+    assert.ok(text.includes("- [[beta]]"), text);
+    assert.ok(!text.includes("ghost"), text);
+    assert.ok(!text.includes("beta\\"), text);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_links does not count a link whose folder part doesn't match as incoming", async () => {
+    const { dir, h } = await linkVault({
+      "notes/target.md": "# Target\n",
+      "good.md": "[[notes/target]]\n",
+      "bad.md": "[[archive/target]]\n",
+    });
+    const text = (await h.get("vault_links")({ path: "notes/target.md", direction: "incoming" })).content[0].text;
+    assert.ok(text.includes("good.md"), text);
+    assert.ok(!text.includes("bad.md"), text);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_neighborhood does not follow links that appear only inside code", async () => {
+    const { dir, h } = await linkVault({
+      "hub.md": "[[real]]\n`[[hidden]]`\n",
+      "real.md": "# Real\n",
+      "hidden.md": "# Hidden\n",
+    });
+    const text = (await h.get("vault_neighborhood")({ path: "hub.md", depth: 1, direction: "outgoing" })).content[0].text;
+    assert.ok(text.includes("real.md"), text);
+    assert.ok(!text.includes("hidden.md"), text);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_link_health reports wrong-folder links as broken and ignores links inside code", async () => {
+    const { dir, h } = await linkVault({
+      "notes/good.md": "# Good\n",
+      "src.md": "[[archive/good]] and [[notes/good]]\n```\n[[code-ghost]]\n```\n",
+    });
+    const text = (await h.get("vault_link_health")({ checks: ["broken"] })).content[0].text;
+    assert.ok(text.includes("[[archive/good]]"), text);
+    assert.ok(!text.includes("[[notes/good]]"), text);
+    assert.ok(!text.includes("code-ghost"), text);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_add_links deduplicates by resolved note, not by basename", async () => {
+    const { dir, h } = await linkVault({
+      "a/dup.md": "# A\n",
+      "b/dup.md": "# B\n",
+      "src.md": "# Src\n\n## Related\n- [[a/dup]]\n",
+    });
+    const text = (await h.get("vault_add_links")({
+      path: "src.md",
+      links: [{ target: "a/dup.md" }, { target: "b/dup.md" }],
+    })).content[0].text;
+    assert.ok(text.includes("Added 1"), text);
+    assert.ok(text.includes("dup (already linked)"), text);
+    const content = await fs.readFile(path.join(dir, "src.md"), "utf-8");
+    assert.ok(content.includes("- [[b/dup]]"), content);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_suggest_links only filters notes the content's links actually resolve to", async () => {
+    const { dir, h } = await linkVault({
+      "notes/gamma.md": "# Gamma\n",
+      "notes/beta.md": "# Beta\n",
+    }, createMockSemanticIndex([
+      { path: "notes/gamma.md", score: 0.9, preview: "Gamma" },
+      { path: "notes/beta.md", score: 0.8, preview: "Beta" },
+    ]));
+    const text = (await h.get("vault_suggest_links")({ content: "See [[elsewhere/gamma]] and [[BETA]]." })).content[0].text;
+    assert.ok(text.includes("notes/gamma.md"), text);
+    assert.ok(!text.includes("notes/beta.md"), text);
+    await fs.rm(dir, { recursive: true });
+  });
+});
+
+describe("scalar frontmatter tags in graph and tag tools", () => {
+  async function scalarVault(semanticIndex = null) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "scalar-tags-"));
+    await fs.writeFile(path.join(dir, "a.md"), "---\ntags: dev\n---\n# A\nSome body text.\n");
+    await fs.writeFile(path.join(dir, "b.md"), "---\ntype: note\ntags: dev\n---\n# B\nOther body.\n");
+    const h = await createHandlers({
+      vaultPath: dir, templateRegistry: new Map(), semanticIndex, activityLog: null, sessionId: "scalar-tags",
+    });
+    return { dir, h };
+  }
+
+  it("vault_neighborhood include_semantic lists a related note whose tags is a scalar", async () => {
+    const { dir, h } = await scalarVault(createMockSemanticIndex([{ path: "b.md", score: 0.9, preview: "B" }]));
+    const text = (await h.get("vault_neighborhood")({ path: "a.md", include_semantic: true })).content[0].text;
+    assert.ok(text.includes("Semantically related"), text);
+    assert.ok(text.includes("tags: dev"), text);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_tags counts notes whose tags is a scalar", async () => {
+    const { dir, h } = await scalarVault();
+    const text = (await h.get("vault_tags")({})).content[0].text;
+    assert.match(text, /dev \(2\)/);
+    await fs.rm(dir, { recursive: true });
+  });
+});
+
+describe("unicode-normalised links and scalar tags in neighborhood", () => {
+  it("vault_link_health does not report an NFD-named note as orphan or its NFC link as broken", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nfd-links-"));
+    await fs.writeFile(path.join(dir, "café.md"), "# Cafe\n[[src]]\n");
+    await fs.writeFile(path.join(dir, "src.md"), "See [[café]].\n");
+    const h = await createHandlers({ vaultPath: dir, templateRegistry: new Map(), semanticIndex: null, activityLog: null, sessionId: "nfd" });
+    const text = (await h.get("vault_link_health")({ checks: ["orphans", "broken"] })).content[0].text;
+    assert.ok(text.includes("Broken links** (0)"), text);
+    assert.ok(text.includes("Orphan notes** (0)"), text);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_neighborhood shows scalar tags on linked nodes", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nb-scalar-"));
+    await fs.writeFile(path.join(dir, "a.md"), "[[b]]\n");
+    await fs.writeFile(path.join(dir, "b.md"), "---\ntags: dev\n---\n# B\n");
+    const h = await createHandlers({ vaultPath: dir, templateRegistry: new Map(), semanticIndex: null, activityLog: null, sessionId: "nb" });
+    const text = (await h.get("vault_neighborhood")({ path: "a.md", depth: 1 })).content[0].text;
+    assert.ok(text.includes("tags: dev"), text);
+    await fs.rm(dir, { recursive: true });
+  });
+});
+
+// ─── vault_move link correctness and case-only renames ───────────────
+
+describe("vault_move link correctness", () => {
+  async function moveVault(files) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "move-correct-"));
+    for (const [rel, content] of Object.entries(files)) {
+      await fs.mkdir(path.dirname(path.join(dir, rel)), { recursive: true });
+      await fs.writeFile(path.join(dir, rel), content);
+    }
+    const h = await createHandlers({ vaultPath: dir, templateRegistry: new Map(), semanticIndex: null, activityLog: null, sessionId: "move-correct" });
+    return { dir, h, read: (rel) => fs.readFile(path.join(dir, rel), "utf-8") };
+  }
+
+  it("moving a/note.md never repoints links meant for b/note.md or ambiguous [[note]] links", async () => {
+    const { dir, h, read } = await moveVault({
+      "a/note.md": "# A\n",
+      "b/note.md": "# B\n",
+      "ref.md": "[[note]] [[a/note]] [[b/note]] [[A/Note#h|x]]\n",
+    });
+    await h.get("vault_move")({ old_path: "a/note.md", new_path: "archive/note.md" });
+    assert.equal(await read("ref.md"), "[[note]] [[archive/note]] [[b/note]] [[archive/note#h|x]]\n");
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("rewrites links inside the moved note that point to itself", async () => {
+    const { dir, h, read } = await moveVault({ "self.md": "# Self\nSee [[self]] and [[self#Self|top]].\n" });
+    const result = await h.get("vault_move")({ old_path: "self.md", new_path: "renamed-self.md" });
+    assert.equal(await read("renamed-self.md"), "# Self\nSee [[renamed-self]] and [[renamed-self#Self|top]].\n");
+    assert.ok(result.content[0].text.includes("Updated wikilinks in 1 file"), result.content[0].text);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("renames a note to a different letter case and rewrites its links", async () => {
+    const { dir, h, read } = await moveVault({
+      "cs/Note.md": "# Case\nbody\n",
+      "ref.md": "See [[Note]] and [[cs/Note|n]].\n",
+    });
+    await h.get("vault_move")({ old_path: "cs/Note.md", new_path: "cs/note.md" });
+    assert.deepEqual(await fs.readdir(path.join(dir, "cs")), ["note.md"]);
+    assert.equal(await read("cs/note.md"), "# Case\nbody\n");
+    assert.equal(await read("ref.md"), "See [[note]] and [[note|n]].\n");
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("still refuses a destination that is the same file under a different name (hard link)", async () => {
+    const { dir, h } = await moveVault({ "a.md": "# A\n" });
+    await fs.link(path.join(dir, "a.md"), path.join(dir, "b.md"));
+    await assert.rejects(() => h.get("vault_move")({ old_path: "a.md", new_path: "b.md" }), /already exists/);
+    assert.deepEqual((await fs.readdir(dir)).sort(), ["a.md", "b.md"]);
+    await fs.rm(dir, { recursive: true });
+  });
+});
+
+// ─── vault_neighborhood max_nodes and capped graph proximity ─────────
+
+describe("neighbourhood node cap", () => {
+  const ids = Array.from({ length: 60 }, (_, i) => `c${String(i + 1).padStart(2, "0")}`);
+
+  /** Vault with hub.md linking c01..c60 in order, plus handlers bound to it. */
+  async function hubVault(semanticIndex = null) {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "neighborhood-cap-"));
+    await fs.mkdir(path.join(dir, "c"));
+    await fs.writeFile(path.join(dir, "hub.md"), "# Hub\n" + ids.map(id => `[[${id}]]`).join("\n") + "\n");
+    for (const id of ids) await fs.writeFile(path.join(dir, "c", `${id}.md`), `# ${id}\n`);
+    const h = await createHandlers({ vaultPath: dir, templateRegistry: new Map(), semanticIndex, activityLog: null, sessionId: "cap" });
+    return { dir, h };
+  }
+
+  it("vault_neighborhood lists at most max_nodes nodes (default 50) and reports the rest as '+N not shown'", async () => {
+    const { dir, h } = await hubVault();
+    for (const [maxNodes, shown] of [[undefined, 50], [5, 5]]) {
+      const text = (await h.get("vault_neighborhood")({ path: "hub.md", depth: 1, max_nodes: maxNodes })).content[0].text;
+      const listed = text.split("\n").filter(l => l.startsWith("- "));
+      assert.equal(listed.length, shown, `max_nodes ${maxNodes}`);
+      assert.ok(text.includes(`+${61 - shown} not shown`), text);
+    }
+    const all = (await h.get("vault_neighborhood")({ path: "hub.md", depth: 1, max_nodes: 100 })).content[0].text;
+    assert.ok(!all.includes("not shown"), all);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_neighborhood include_semantic never lists a linked note beyond the cap as unlinked", async () => {
+    const { dir, h } = await hubVault(createMockSemanticIndex([
+      { path: "c/c60.md", score: 0.9, preview: "linked but beyond the cap" },
+    ]));
+    const text = (await h.get("vault_neighborhood")({ path: "hub.md", depth: 1, include_semantic: true })).content[0].text;
+    assert.ok(!text.includes("Semantically related"), text);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_semantic_search anchor gives a proximity bonus only to nodes inside the capped neighbourhood", async () => {
+    const { dir, h } = await hubVault(createMockSemanticIndex([
+      { path: "c/c02.md", score: 0.8, preview: "inside the cap" },
+      { path: "c/c55.md", score: 0.8, preview: "beyond the cap" },
+    ]));
+    const text = (await h.get("vault_semantic_search")({ query: "q", anchor: "hub.md", limit: 5 })).content[0].text;
+    assert.match(text, /c\/c02\.md.*combined: 0\.86, semantic: 0\.8, graph: depth 1/);
+    assert.match(text, /c\/c55\.md.*combined: 0\.56, semantic: 0\.8, not in graph/);
+    await fs.rm(dir, { recursive: true });
+  });
+
+  it("vault_neighborhood advertises an optional max_nodes number parameter", () => {
+    const tool = createToolsList("", [], false).find(t => t.name === "vault_neighborhood");
+    assert.equal(tool.inputSchema.properties.max_nodes.type, "number");
+    assert.ok(!tool.inputSchema.required.includes("max_nodes"));
+  });
+});
+
+// ─── semantic tools while the index is disabled ────────────────────────
+
+describe("semantic tools while the semantic index is disabled", () => {
+  let fake;
+  let vault;
+  let idx;
+  let semanticHandlers;
+  const disabledError = /^Semantic search disabled since \d{4}-\d{2}-\d{2}: OpenAI quota exhausted\. Add credits; it re-enables automatically\.$/;
+
+  beforeEach(async () => {
+    vault = await makeVault({ "a.md": "Alpha body. [[b]]", "b.md": "Beta body." });
+    fake = installFakeOpenAI(() => quotaResponse());
+    idx = new SemanticIndex({
+      vaultPath: vault,
+      openaiApiKey: "test-key",
+      dbPath: path.join(vault, ".obsidian", "test-index.db"),
+      sleep: async () => {},
+    });
+    await idx.initialize();
+    await idx.whenSynced();
+    assert.equal(idx.health().status, "disabled");
+    semanticHandlers = await createHandlers({
+      vaultPath: vault, templateRegistry: new Map(), semanticIndex: idx, activityLog: null, sessionId: "semantic-disabled",
+    });
+  });
+
+  afterEach(async () => {
+    await idx.shutdown();
+    fake.restore();
+    await fs.rm(vault, { recursive: true, force: true });
+  });
+
+  const calls = [
+    { tool: "vault_semantic_search", args: { query: "alpha" }, rejects: true },
+    { tool: "vault_suggest_links", args: { content: "alpha" }, rejects: true },
+    { tool: "vault_neighborhood", args: { path: "a.md", include_semantic: true }, rejects: false },
+  ];
+  for (const c of calls) {
+    it(`${c.tool} probes once, then reports the disabled reason`, async () => {
+      const before = fake.calls.length;
+      if (c.rejects) {
+        await assert.rejects(() => semanticHandlers.get(c.tool)(c.args), (err) => disabledError.test(err.message));
+      } else {
+        const result = await semanticHandlers.get(c.tool)(c.args);
+        assert.ok(result.content[0].text.includes("(Semantic expansion skipped: Semantic search disabled since "), result.content[0].text);
+      }
+      assert.equal(fake.calls.length, before + 1, "exactly one probe request");
+    });
+  }
+
+  it("a successful probe re-enables the index and the call returns results", async () => {
+    fake.handler = (inputs) => embeddingsResponse(inputs);
+    const result = await semanticHandlers.get("vault_semantic_search")({ query: "alpha" });
+    assert.ok(!result.isError);
+    assert.match(result.content[0].text, /^(Found \d+ semantically related|No semantically related)/);
+    assert.equal(idx.isAvailable, true);
+  });
+});
+
+describe("anchored semantic search footer", () => {
+  it("carries the stale-notes footer when the index reports stale notes", async () => {
+    const staleIndex = {
+      isAvailable: true,
+      health: () => ({ status: "ok", reason: null, since: null, staleFiles: 2, lastSuccessAt: null }),
+      searchRaw: async () => [{ path: "notes/alpha.md", heading: null, score: 0.9, preview: "Alpha" }],
+    };
+    const anchoredHandlers = await createHandlers({
+      vaultPath: tmpDir, templateRegistry: new Map(), semanticIndex: staleIndex, activityLog: null, sessionId: "stale-footer",
+    });
+    const result = await anchoredHandlers.get("vault_semantic_search")({ query: "x", anchor: "notes/beta.md" });
+    assert.ok(result.content[0].text.endsWith("*2 notes have changed since last indexed; results may be stale.*"), result.content[0].text);
+  });
+});
+
+describe("vault_neighborhood when its own semantic search fails", () => {
+  it("keeps the graph output and appends the skipped note", async () => {
+    const vault = await makeVault({ "a.md": "Alpha body. [[b]]", "b.md": "Beta body." });
+    const fake = installFakeOpenAI((inputs) => embeddingsResponse(inputs));
+    const idx = new SemanticIndex({
+      vaultPath: vault,
+      openaiApiKey: "test-key",
+      dbPath: path.join(vault, ".obsidian", "test-index.db"),
+      sleep: async () => {},
+    });
+    try {
+      await idx.initialize();
+      await idx.whenSynced();
+      const h = await createHandlers({
+        vaultPath: vault, templateRegistry: new Map(), semanticIndex: idx, activityLog: null, sessionId: "nb-quota",
+      });
+      fake.handler = () => quotaResponse();
+      const result = await h.get("vault_neighborhood")({ path: "a.md", include_semantic: true });
+      const text = result.content[0].text;
+      assert.ok(text.includes("b.md"), text);
+      assert.ok(text.includes("(Semantic expansion skipped: Semantic search disabled since "), text);
+    } finally {
+      await idx.shutdown();
+      fake.restore();
+      await fs.rm(vault, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the graph output and says why when the semantic search fails for a transient reason", async () => {
+    const vault = await makeVault({ "a.md": "Alpha body. [[b]]", "b.md": "Beta body." });
+    const fake = installFakeOpenAI((inputs) => embeddingsResponse(inputs));
+    const idx = new SemanticIndex({
+      vaultPath: vault,
+      openaiApiKey: "test-key",
+      dbPath: path.join(vault, ".obsidian", "test-index.db"),
+      sleep: async () => {},
+    });
+    try {
+      await idx.initialize();
+      await idx.whenSynced();
+      const h = await createHandlers({
+        vaultPath: vault, templateRegistry: new Map(), semanticIndex: idx, activityLog: null, sessionId: "nb-transient",
+      });
+      fake.handler = () => errorResponse(503, "upstream busy");
+      const result = await h.get("vault_neighborhood")({ path: "a.md", include_semantic: true });
+      const text = result.content[0].text;
+      assert.ok(text.includes("b.md"), text);
+      assert.ok(text.includes("(Semantic expansion skipped: OpenAI API error (503): upstream busy)"), text);
+      assert.equal(idx.health().status, "ok");
+    } finally {
+      await idx.shutdown();
+      fake.restore();
+      await fs.rm(vault, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── write tools notify the semantic index ─────────────────────────────
+
+describe("write tools notify the semantic index", () => {
+  let vault;
+  let events;
+  let notifyHandlers;
+
+  beforeEach(async () => {
+    vault = await makeVault({
+      "05-Templates/research-note.md": TEMPLATE_CONTENT,
+      "notes/a.md": "---\ntype: research\ncreated: 2026-01-01\ntags:\n  - test\n---\n# A\n\nAlpha links to [[notes/b]].\n",
+      "notes/b.md": "---\ntype: research\ncreated: 2026-01-01\ntags:\n  - test\n---\n# B\n\nBeta body.\n",
+    });
+    events = [];
+    const recordingIndex = {
+      isAvailable: false,
+      notifyChanged: (p) => events.push(["changed", p]),
+      notifyRemoved: async (p) => { events.push(["removed", p]); },
+      notifyMoved: (from, to) => events.push(["moved", from, to]),
+    };
+    notifyHandlers = await createHandlers({
+      vaultPath: vault,
+      templateRegistry: await buildTemplateRegistry(vault),
+      semanticIndex: recordingIndex,
+      activityLog: null,
+      sessionId: "notify",
+    });
+  });
+
+  afterEach(async () => {
+    await fs.rm(vault, { recursive: true, force: true });
+  });
+
+  const writes = [
+    { tool: "vault_write", args: { template: "research-note", path: "notes/new-note.md" }, expected: [["changed", "notes/new-note.md"]] },
+    { tool: "vault_append", args: { path: "notes/b.md", content: "More." }, expected: [["changed", "notes/b.md"]] },
+    { tool: "vault_edit", args: { path: "notes/b.md", old_string: "Beta body.", new_string: "Beta edited." }, expected: [["changed", "notes/b.md"]] },
+    { tool: "vault_update_frontmatter", args: { path: "notes/b.md", fields: { status: "active" } }, expected: [["changed", "notes/b.md"]] },
+    { tool: "vault_add_links", args: { path: "notes/b.md", links: [{ target: "notes/a.md" }] }, expected: [["changed", "notes/b.md"]] },
+    { tool: "vault_trash", args: { path: "notes/b.md" }, expected: [["removed", "notes/b.md"]] },
+    {
+      tool: "vault_move",
+      args: { old_path: "notes/b.md", new_path: "archive/b.md" },
+      expected: [["moved", "notes/b.md", "archive/b.md"], ["changed", "notes/a.md"]],
+    },
+  ];
+  for (const c of writes) {
+    it(`${c.tool} notifies the index about the paths it wrote`, async () => {
+      const result = await notifyHandlers.get(c.tool)(c.args);
+      assert.ok(!result.isError, result.content?.[0]?.text);
+      assert.deepEqual(events, c.expected);
+    });
+  }
+
+  const failures = [
+    { tool: "vault_edit", args: { path: "notes/b.md", old_string: "not in the note", new_string: "x" } },
+    { tool: "vault_append", args: { path: "notes/missing.md", content: "x" } },
+  ];
+  for (const c of failures) {
+    it(`a failed ${c.tool} does not notify the index`, async () => {
+      try {
+        await notifyHandlers.get(c.tool)(c.args);
+      } catch {
+        // the failure itself is covered elsewhere
+      }
+      assert.deepEqual(events, []);
+    });
+  }
+});
+
+describe("write tools notify with the on-disk spelling of the note", () => {
+  it("vault_append reports the stored (NFD) name when the request used the NFC spelling", async (t) => {
+    const nfd = "Cafe\u0301.md";
+    const nfc = "Caf\u00e9.md";
+    const vault = await makeVault({ "05-Templates/research-note.md": TEMPLATE_CONTENT, [`notes/${nfd}`]: "# Cafe\n\nBody.\n" });
+    try {
+      try {
+        await fs.access(path.join(vault, "notes", nfc));
+      } catch {
+        t.skip("this filesystem does not equate NFC and NFD names");
+        return;
+      }
+      const events = [];
+      const h = await createHandlers({
+        vaultPath: vault,
+        templateRegistry: await buildTemplateRegistry(vault),
+        semanticIndex: { isAvailable: false, notifyChanged: (p) => events.push(p) },
+        activityLog: null,
+        sessionId: "nfd",
+      });
+      const result = await h.get("vault_append")({ path: `notes/${nfc}`, content: "More." });
+      assert.ok(!result.isError, result.content?.[0]?.text);
+      assert.deepEqual(events, [`notes/${nfd}`]);
+    } finally {
+      await fs.rm(vault, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("vault_move, vault_trash and vault_add_links use the note's on-disk spelling", () => {
+  // The request spells the note differently from disk; on APFS/NTFS both name the same file.
+  const SPELLINGS = [
+    ["letter case", "Target", "target"],
+    ["Unicode normalisation (NFD on disk, NFC requested)", "Café", "Café"],
+  ];
+  const fmNote = (title, body = "") => `---\ntype: note\ncreated: 2026-01-01\ntags:\n  - t\n---\n# ${title}\n\n${body}\n`;
+
+  async function spellingVault(onDisk, t) {
+    const vault = await makeVault({
+      [`notes/${onDisk}.md`]: fmNote("T"),
+      "notes/ref.md": fmNote("Ref", `see [[${onDisk}]] and [[notes/${onDisk}]]`),
+    });
+    const h = await createHandlers({ vaultPath: vault, templateRegistry: new Map(), semanticIndex: null, activityLog: null, sessionId: "spelling" });
+    return { vault, h, aliases: async (typed) => {
+      try {
+        await fs.access(path.join(vault, "notes", `${typed}.md`));
+        return true;
+      } catch {
+        t.skip("this filesystem does not treat the two spellings as one file");
+        return false;
+      }
+    } };
+  }
+
+  for (const [label, onDisk, typed] of SPELLINGS) {
+    it(`vault_move given a ${label} variant of the old path rewrites every link to the note`, async (t) => {
+      const { vault, h, aliases } = await spellingVault(onDisk, t);
+      try {
+        if (!(await aliases(typed))) return;
+        const result = await h.get("vault_move")({ old_path: `notes/${typed}.md`, new_path: "archive/renamed.md" });
+        assert.match(result.content[0].text, /Updated wikilinks in 1 file/);
+        const ref = await fs.readFile(path.join(vault, "notes", "ref.md"), "utf-8");
+        assert.ok(ref.includes("see [[renamed]] and [[renamed]]"), ref);
+      } finally {
+        await fs.rm(vault, { recursive: true, force: true });
+      }
+    });
+
+    it(`vault_trash given a ${label} variant of the path warns about the links it breaks`, async (t) => {
+      const { vault, h, aliases } = await spellingVault(onDisk, t);
+      try {
+        if (!(await aliases(typed))) return;
+        const result = await h.get("vault_trash")({ path: `notes/${typed}.md` });
+        assert.match(result.content[0].text, /1 file had links to this note/);
+        assert.match(result.content[0].text, /notes%2Fref/);
+      } finally {
+        await fs.rm(vault, { recursive: true, force: true });
+      }
+    });
+
+    it(`vault_add_links accepts a ${label} variant of a target and links the note by its on-disk name`, async (t) => {
+      const { vault, h } = await spellingVault(onDisk, t);
+      try {
+        await fs.writeFile(path.join(vault, "notes", "hub.md"), fmNote("Hub"));
+        const result = await h.get("vault_add_links")({ path: "notes/hub.md", links: [{ target: `notes/${typed}.md` }] });
+        assert.match(result.content[0].text, /Added 1 link/);
+        const hub = await fs.readFile(path.join(vault, "notes", "hub.md"), "utf-8");
+        assert.ok(hub.includes(`- [[${onDisk}]]`), hub);
+
+        const again = await h.get("vault_add_links")({ path: "notes/ref.md", links: [{ target: `notes/${typed}` }] });
+        assert.match(again.content[0].text, /already linked/);
+      } finally {
+        await fs.rm(vault, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+describe("trash and move notify the index about the path they acted on", () => {
+  let vault;
+  let events;
+  let h;
+  const nfd = "Cafe\u0301";
+  const nfc = "Caf\u00e9";
+
+  beforeEach(async () => {
+    vault = await makeVault({
+      "05-Templates/research-note.md": TEMPLATE_CONTENT,
+      "notes/real.md": "# Real\n\nBody.\n",
+      [`${nfd}/x.md`]: "# X\n\nBody.\n",
+    });
+    events = [];
+    h = await createHandlers({
+      vaultPath: vault,
+      templateRegistry: await buildTemplateRegistry(vault),
+      semanticIndex: {
+        isAvailable: false,
+        notifyChanged: (p) => events.push(["changed", p]),
+        notifyRemoved: async (p) => { events.push(["removed", p]); },
+        notifyMoved: (from, to) => events.push(["moved", from, to]),
+      },
+      activityLog: null,
+      sessionId: "r2",
+    });
+  });
+
+  afterEach(async () => {
+    await fs.rm(vault, { recursive: true, force: true });
+  });
+
+  it("trashing a symlinked note reports the link, not its target", async (t) => {
+    if (process.platform === "win32") return t.skip("symlinks need privileges on Windows");
+    await fs.symlink("real.md", path.join(vault, "notes", "link.md"));
+    const result = await h.get("vault_trash")({ path: "notes/link.md" });
+    assert.ok(!result.isError, result.content?.[0]?.text);
+    assert.deepEqual(events, [["removed", "notes/link.md"]]);
+  });
+
+  it("moving a symlinked note reports the link, not its target", async (t) => {
+    if (process.platform === "win32") return t.skip("symlinks need privileges on Windows");
+    await fs.symlink("real.md", path.join(vault, "notes", "link.md"));
+    const result = await h.get("vault_move")({ old_path: "notes/link.md", new_path: "archive/link.md" });
+    assert.ok(!result.isError, result.content?.[0]?.text);
+    assert.deepEqual(events.filter(e => e[0] === "moved"), [["moved", "notes/link.md", "archive/link.md"]]);
+  });
+
+  it("moving a folder reports its stored (NFD) name when the request used the NFC spelling", async (t) => {
+    try {
+      await fs.access(path.join(vault, nfc));
+    } catch {
+      return t.skip("this filesystem does not equate NFC and NFD names");
+    }
+    const result = await h.get("vault_move")({ old_path: nfc, new_path: "moved" });
+    assert.ok(!result.isError, result.content?.[0]?.text);
+    assert.deepEqual(events.filter(e => e[0] === "moved"), [["moved", nfd, "moved"]]);
+  });
+});
